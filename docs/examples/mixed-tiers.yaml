@@ -1,0 +1,14 @@
+# A lead tier on Claude Code, scoped tiers on cheaper models.
+executors:
+  default: "opus"
+  allowed: [opus, sonnet, hermes, opencode, manual, mock]
+  flavors:
+    opencode: scoped             # (the default) follow the plan exactly, block on decisions
+  arg_kick: [opencode]
+  paste_kick: [hermes]
+  models:
+    opencode: "deepseek-chat"    # example scoped-tier model
+    opencode_provider: "deepseek"
+  unblock_executor: "sonnet"     # an unblocker needs judgment: use a lead-tier model
+  auto_unblock: [hermes, opencode]
+  retier_on_max_unblock: "opus"

@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux git
+          python3 -m pip install pytest rich
+      - name: Syntax
+        run: |
+          bash -n bin/orch lib/*.sh lib/adapters/*.sh tests/*.sh
+          python3 -m py_compile lib/*.py
+      - name: Mock cycle
+        run: |
+          git config --global user.name ci
+          git config --global user.email ci@example.invalid
+          TMUX_TMPDIR=$(mktemp -d) tests/test_mock_cycle.sh
+      - name: Unit tests
+        run: python3 -m pytest tests -q

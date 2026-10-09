@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# orch — the single entry point to the standalone orchestration framework.
+#
+# Run it from anywhere inside an instance directory (the folder holding
+# orch.yaml), or point it at one with ORCH_INSTANCE=/path/to/instance.
+#
+#   orch init [dir] [--preset <name>] [--name "..."] [--session <tmux>]
+#   orch start [lanes...]        orch status [full]        orch lint
+#   orch day | night | pause [lane] | resume | stop [lane] | unstop
+#   orch assign <id> <executor|default>     orch assignments [all]
+#   orch approve <id>            orch dispatch <id>        orch reset <id>
+#   orch done <id> [summary]     orch blocked <id> [reason]
+#   orch closecheck <id>         the stop-line check `done` runs (exit 0 PASS, 3 REFUSE)
+#   orch longrun [--venv <dir>] <log> -- <cmd...>   setsid job, real PID, tail/ps handover
+#   orch venvcheck <venv>        CLEAR / ARMED / BUSY before using or arming a shared venv
+#   orch adopt <id>              claim an already-open window as the row's session
+#   orch hold <id> <res>[,<res>...] -- <cmd...>   orch commit <id> -m "msg" -- <paths...>
+#   orch guard status|start|finish|allowlist|force-release
+#   orch dashboard [current|focused|full] [--lane L]
+#   orch monitor [--once] [--next 5] [--lane L]
+#   orch bot start|stop|status|test|doctor|poll
+#   orch notify "Title" "Body"   orch attach                orch prompt <id>
+#   orch json                    orch version
+set -u
+
+ORCH_BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ORCH_HOME="$(dirname "$ORCH_BIN")"
+LIB="$ORCH_HOME/lib"
+CORE="$LIB/orchestrator_core.sh"
+GUARD="$LIB/parallel_guard_core.sh"
+export ORCH_HOME
+
+usage(){ sed -n '2,/^set -u$/{/^set -u$/!p}' "$0"; }   # the header block, however long
+
+cfg_sh(){ python3 "$LIB/config_parser.py" --sh; }
+
+# --- init ------------------------------------------------------------------
+do_init(){
+  local dir="" preset="" name="" session=""
+  while (( $# )); do
+    case $1 in
+      --preset)  preset=$2; shift 2 ;;
+      --name)    name=$2; shift 2 ;;
+      --session) session=$2; shift 2 ;;
+      -*) echo "unknown flag $1"; exit 1 ;;
+      *) dir=$1; shift ;;
+    esac
+  done
+  dir="${dir:-$PWD}"
+  mkdir -p "$dir"/{state,control,leases,prompts,unblock}
+  dir="$(cd "$dir" && pwd)"
+  name="${name:-$(basename "$(dirname "$dir")")}"
+  session="${session:-$(basename "$(dirname "$dir")" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')}"
+  if [[ -f "$dir/orch.yaml" ]]; then
+    echo "orch.yaml already exists in $dir — not overwriting."
+  else
+    cat > "$dir/orch.yaml" <<YAML
+# orch.yaml — instance configuration. See $ORCH_HOME/README.md
+version: "1.0"
+
+project:
+  name: "$name"
+  root: "../../.."         # cwd for every executor window (project root)
+  workspace: ".."          # queue plan paths + reports are relative to this
+  tmux_session: "$session"
+  reports_dir: "REPORTS"
+
+lanes:
+  auto_discover: true      # any queue_<L>.tsv in this folder becomes a lane
+  order: []                # optional explicit lane order
+  poll_interval: 60
+  stall_warning_seconds: 2700
+
+executors:
+  default: "opus"
+  allowed: [opus, sonnet, haiku, hermes, hermespro, codex, gemini, opencode, manual, mock]
+  paste_kick: [hermes, hermespro]
+  max_unblock_attempts: 3
+  retier_on_max_unblock: "opus"
+  unblock_executor: "hermes"
+  models: {}
+  bin: {}
+
+guard:
+  git_repo: ""             # empty -> the workspace
+  git_lock: "git-lock"
+  auto_phase_isolation: true
+  shared_paths:
+    - "DECISIONS.md"
+  resources:
+    - "git-lock"
+  compliance_scanners: []
+
+watchdog:
+  enabled: false
+  telegram_chat_id: ""
+  bot_token_env_var: "STATUS_BOT_TOKEN"
+  status_bot_allowed_user: ""
+  env_file: "~/.config/orch/env"
+  hermes_push_fallback: true
+  poll_interval: 20
+  quiet_hours:
+    from: ""
+    to: ""
+YAML
+    echo "wrote $dir/orch.yaml"
+  fi
+  if [[ ! -f "$dir/queue_A.tsv" ]]; then
+    printf '%s\n' \
+      '# Lane A ladder. Columns, whitespace-separated:' \
+      '#   id  deps  hard_gate  executor  plan_path  [extra_allowlist_paths]' \
+      '# deps: comma-separated row ids, or - for none.' \
+      '# hard_gate: 1 = the watcher stops before this row until `orch approve <id>`.' \
+      '# plan_path: relative to the workspace, e.g. PHASE_A/setup/PLAN.md' \
+      '# extra allowlist (optional 6th column): comma/space separated extra paths' \
+      '#   this row may stage, on top of its own phase folder + report pack.' \
+      '# The watcher rescans this file every pass — appending rows live is SAFE.' \
+      '' > "$dir/queue_A.tsv"
+    echo "wrote $dir/queue_A.tsv (empty ladder)"
+  fi
+  # A self-locating entry point INSIDE the instance. Executors run from the
+  # project root, where `orch` alone cannot find an orch.yaml (find_instance
+  # walks up, never down). This wrapper pins the instance, so a work order can
+  # say `<instance>/orch commit <id> -- <paths>` from anywhere.
+  cat > "$dir/orch" <<WRAP
+#!/usr/bin/env bash
+# Auto-generated by \`orch init\`. Pins this instance and delegates to the
+# framework CLI. Safe to commit; safe to move together with the instance.
+export ORCH_INSTANCE="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+exec "$ORCH_HOME/bin/orch" "\$@"
+WRAP
+  chmod +x "$dir/orch"
+  echo "wrote $dir/orch (self-locating CLI wrapper)"
+
+  if [[ -n $preset ]]; then
+    local src="$ORCH_HOME/templates/presets/$preset"
+    [[ -d $src ]] || { echo "no preset '$preset' in $ORCH_HOME/templates/presets"; exit 1; }
+    cp -n "$src"/* "$dir/prompts/" 2>/dev/null || true
+    echo "copied preset '$preset' into $dir/prompts/ (edit freely — instance copies win over framework defaults)"
+  fi
+  echo
+  echo "instance ready: $dir"
+  echo "next:  orch lint     (validate the ladder)"
+  echo "       orch start    (bring the watchers up in tmux)"
+}
+
+# --- bot daemon ------------------------------------------------------------
+bot(){
+  eval "$(cfg_sh)"
+  local win="orch-bot"
+  case "${1:-status}" in
+    start)
+      tmux has-session -t "$ORCH_TMUX" 2>/dev/null || tmux new-session -d -s "$ORCH_TMUX" -n control -c "$ORCH_ROOT"
+      if tmux list-windows -t "$ORCH_TMUX" -F '#{window_name} #{pane_dead}' | grep -q "^$win 0$"; then
+        echo "status bot already running (tmux window '$win')"
+      else
+        tmux kill-window -t "$ORCH_TMUX:$win" 2>/dev/null || true
+        tmux new-window -d -t "$ORCH_TMUX" -n "$win" -c "$ORCH_ROOT" \
+          "ORCH_INSTANCE='$ORCH_INSTANCE' python3 '$LIB/telegram_bot.py' daemon"
+        echo "status bot started (tmux window '$win' in session $ORCH_TMUX)"
+      fi ;;
+    stop)   tmux kill-window -t "$ORCH_TMUX:$win" 2>/dev/null && echo "status bot stopped" || echo "status bot was not running" ;;
+    status) tmux list-windows -t "$ORCH_TMUX" -F '#{window_name} #{pane_dead}' 2>/dev/null | grep -q "^$win 0$" \
+              && echo "status bot RUNNING (tmux $ORCH_TMUX:$win)" || echo "status bot not running" ;;
+    poll)   python3 "$LIB/telegram_bot.py" poll ;;
+    test)   python3 "$LIB/telegram_bot.py" test ;;
+    doctor) python3 "$LIB/telegram_bot.py" doctor ;;
+    *) echo "usage: orch bot start|stop|status|poll|test|doctor"; exit 1 ;;
+  esac
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  init)        do_init "$@" ;;
+  status)      python3 "$LIB/state_resolver.py" $( [[ "${1:-}" == full ]] && echo --full ) ;;
+  json)        python3 "$LIB/state_resolver.py" --json ;;
+  lint)        python3 "$LIB/lint.py" ;;
+  dashboard)   python3 "$LIB/dashboard_tui.py" "$@" ;;
+  monitor)     python3 "$LIB/monitor_tui.py" "$@" ;;
+  bot)         bot "$@" ;;
+  notify)      python3 "$LIB/telegram_bot.py" push --title "${1:-test}" --body "${2:-}" --force ;;
+  prompt)      exec "$CORE" prompt "$1" ;;   # regenerate a row's work order
+  closecheck)  exec python3 "$LIB/close_check.py" "${1:?usage: orch closecheck <id>}" ;;
+  longrun)     exec "$LIB/longrun.sh" longrun "$@" ;;
+  venvcheck)   exec "$LIB/longrun.sh" venvcheck "$@" ;;
+  attach)      eval "$(cfg_sh)"; exec tmux attach -t "$ORCH_TMUX" ;;
+  watch)       exec "$CORE" watch ;;   # detachable desktop viewer window
+  # guard surfaces
+  hold)        exec "$GUARD" hold "$@" ;;
+  commit)      exec "$GUARD" commit "$@" ;;
+  guard)       exec "$GUARD" "$@" ;;
+  # engine surfaces
+  start|run|launch|dispatch|assign|assignments|done|blocked|approve|reset|adopt|lease|day|night|pause|resume|stop|unstop)
+               exec "$CORE" "$cmd" "$@" ;;
+  version)     echo "orch 1.0.0 (standalone orchestration framework) — $ORCH_HOME" ;;
+  ""|help|-h|--help) usage ;;
+  *)           echo "unknown command '$cmd'"; echo; usage; exit 1 ;;
+esac
