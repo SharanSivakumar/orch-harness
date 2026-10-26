@@ -1,32 +1,63 @@
 #!/usr/bin/env bash
-# orch — the single entry point to the standalone orchestration framework.
+# orch — the single entry point to the orchestration framework (v2).
 #
 # Run it from anywhere inside an instance directory (the folder holding
 # orch.yaml), or point it at one with ORCH_INSTANCE=/path/to/instance.
 #
+# Rig
 #   orch init [dir] [--preset <name>] [--name "..."] [--session <tmux>]
-#   orch start [lanes...]        orch status [full]        orch lint
-#   orch day | night | pause [lane] | resume | stop [lane] | unstop
-#   orch assign <id> <executor|default>     orch assignments [all]
-#   orch approve <id>            orch dispatch <id>        orch reset <id>
-#   orch done <id> [summary]     orch blocked <id> [reason]
-#   orch closecheck <id>         the stop-line check `done` runs (exit 0 PASS, 3 REFUSE)
-#   orch longrun [--venv <dir>] <log> -- <cmd...>   setsid job, real PID, tail/ps handover
-#   orch venvcheck <venv>        CLEAR / ARMED / BUSY before using or arming a shared venv
-#   orch adopt <id>              claim an already-open window as the row's session
-#   orch hold <id> <res>[,<res>...] -- <cmd...>   orch commit <id> -m "msg" -- <paths...>
-#   orch guard status|start|finish|allowlist|force-release
-#   orch dashboard [current|focused|full] [--lane L]
-#   orch monitor [--once] [--next 5] [--lane L]
-#   orch bot start|stop|status|test|doctor|poll
-#   orch notify "Title" "Body"   orch attach                orch prompt <id>
-#   orch json                    orch version
+#   orch setup questions|apply|defaults|rules|card|check   (docs/SETUP_AGENT_GUIDE.md)
+#   orch start [lanes...]        enable lanes (all when none named) and bring the engine up
+#   orch status [full] | json    orch dashboard [current|focused|full] [--lane L]   orch monitor
+#   orch lint                    orch preflight [--round R | ids | --pending] [--run] [--review]
+#   orch day | night | pause [lane] | resume [lane] | stop [lane] | unstop | disable <lanes>
+#   orch engine status|stop|log|tick                  orch migrate [--apply] [--archive-complete] [--retire-stale-controls]
+# Rows
+#   orch assign <id> <executor|default>   orch assignments [all]   orch approve <id>
+#   orch dispatch <id>           orch reset <id>          orch adopt <id>     orch prompt <id>... | --all-pending
+#   orch rearm <id> "reason" | orch rearm round-start <tag> "reason"   (a row with rearm= on its queue line asks the engine)
+#   orch row add <lane> "<queue line>" "why"   add a row (operator; planner / course-loop sessions: the engine validates)
+#   orch row diff | orch row sync ["why"]      queue edits outside row add (guard.queue_watch); sync = operator accepts
+#   orch done <id> "summary"     orch blocked <id> "reason"     orch escalate <id> "why"   (ROUTE_A)
+#                                (done runs the close checks now; the engine re-checks and reviews)
+#   orch done <id> "summary" --outcome go|nogo|held|fail|infeasible   a verdict row's answer (needs=go holds on non-go;
+#                                infeasible = the remaining plan cannot reach the goal: replan, never re-run)
+#   orch verdict <ub-|rv-|pf-session> <VERDICT> "summary"       (unblockers, reviewers, plan reviews)
+#   orch closecheck <id>         the stop-line check on its own
+# Rounds, decisions, telemetry
+#   orch round new|add-lanes|start|status|close|list|archive|score ...
+#   orch archive <lanes...> | --complete      orch score [--show]
+#   orch gd next|index|digest|show|grep|set-status|check ...
+#   orch report [--round R] [--json]
+# Guard
+#   orch hold <id> <res>[,<res>...] -- <cmd...>   orch commit <id|plan:TAG> -m "msg" -- <paths...>
+#   orch lease acquire|release <res> <owner>      orch guard status|start|finish|allowlist|protected|force-release
+#   orch longrun [--venv <dir>] <log> -- <cmd...>  orch venvcheck <venv>
+# Autonomy (v3)
+#   orch service install|uninstall|status         systemd user units: engine, bot, dead-man timer
+#   orch steward status|incidents|log|inbox [done <k>]    the Steward lane (incidents, acts, Owner inbox, duties)
+#   orch steward close <n> "why"                  the Owner closes an incident by hand (owner-closed; refused in a session)
+#   orch park <row> ["why"] | orch unpark <row>   the Owner parks/releases a row (a named carry)
+#   orch revert [<k> [--dry-run]]                 the Owner undoes STEWARD_LOG line k (one orch command; else printed)
+#   orch executor status                          each executor: normal, or in rate-limit fallback since … -> target
+#   orch executor fallback <X> --dry-run          what would move where now (changes nothing); without --dry-run engages by hand
+#   orch executor restore <X> ["why"]             clear X's fallback; the pending rows it moved go back to X (the Owner's)
+#   orch why <id>                                 plain words: the row's phase, its blocker, its last 5 events
+#   orch sw <action> … "why"                      Steward/planner sessions only (engine-validated)
+#   orch digest [--send] [--since <epoch>]        the Owner's digest (digest.times sends it on schedule)
+#   orch spend run --provider P --est USD [--row id] [--envelope id] -- <cmd…>   a paid command, reserved
+#                                                 against the approved caps (over a cap: SPEND_WAIT <id>, exit 75)
+#   orch spend status|ledger|caps [approve]|answer <id> A|B   the spend governor (approve/answer: the Owner's)
+#   orch phase open <P> [--caps rows=N,rulings=N,days=N,loops=N,replans=N] [--rounds a,b] [--session-loops on|off]
+#   orch phase rest|close <P> ["why"] | approve
+#   orch phase status                             the phase fence (phases.yaml): open/rest/close/approve are the Owner's
+# Other
+#   orch bot start|stop|status|test|doctor|poll   orch notify "Title" "Body"   orch attach   orch version
 set -u
 
 ORCH_BIN="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 ORCH_HOME="$(dirname "$ORCH_BIN")"
 LIB="$ORCH_HOME/lib"
-CORE="$LIB/orchestrator_core.sh"
 GUARD="$LIB/parallel_guard_core.sh"
 export ORCH_HOME
 
@@ -51,12 +82,14 @@ do_init(){
   dir="$(cd "$dir" && pwd)"
   name="${name:-$(basename "$(dirname "$dir")")}"
   session="${session:-$(basename "$(dirname "$dir")" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')}"
+  local fresh=0
   if [[ -f "$dir/orch.yaml" ]]; then
     echo "orch.yaml already exists in $dir — not overwriting."
   else
+    fresh=1
     cat > "$dir/orch.yaml" <<YAML
 # orch.yaml — instance configuration. See $ORCH_HOME/README.md
-version: "1.0"
+version: "2.0"
 
 project:
   name: "$name"
@@ -73,13 +106,29 @@ lanes:
 
 executors:
   default: "opus"
-  allowed: [opus, sonnet, haiku, hermes, hermespro, codex, gemini, opencode, manual, mock]
-  paste_kick: [hermes, hermespro]
-  max_unblock_attempts: 3
+  allowed: [opus, sonnet, haiku, codex, gemini, opencode, manual, mock]
+  max_unblock_attempts: 2
   retier_on_max_unblock: "opus"
-  unblock_executor: "hermes"
+  unblock_executor: "sonnet"
+  auto_unblock: [sonnet, gemini, opencode, codex]
+  dead_window_policy: "retier"
   models: {}
   bin: {}
+  args: {}                 # extra CLI args per executor, e.g. {opus: ["--effort", "high"]}
+  env: {}                  # extra environment per executor
+  max_parallel: {}         # per-executor session caps, e.g. {opus: 4}
+
+scheduler:
+  mode: "dag"              # dag: declared deps only · serial: a row also waits for every row above it in its lane
+  max_parallel: 8          # live sessions of every kind
+  min_free_mb: 3072        # no dispatch while MemAvailable is below this
+
+review:
+  policy: "all"            # all | junior | none — independent review on a different executor before a row counts
+
+close:
+  require_progress: true
+  require_commit: false
 
 guard:
   git_repo: ""             # empty -> the workspace
@@ -97,7 +146,7 @@ watchdog:
   bot_token_env_var: "STATUS_BOT_TOKEN"
   status_bot_allowed_user: ""
   env_file: "~/.config/orch/env"
-  hermes_push_fallback: true
+  push_min_urgency: "normal"   # normal | critical — which engine events reach the phone
   poll_interval: 20
   quiet_hours:
     from: ""
@@ -108,13 +157,13 @@ YAML
   if [[ ! -f "$dir/queue_A.tsv" ]]; then
     printf '%s\n' \
       '# Lane A ladder. Columns, whitespace-separated:' \
-      '#   id  deps  hard_gate  executor  plan_path  [extra_allowlist_paths]' \
+      '#   id  deps  gate  executor  plan_path  [extras…]' \
       '# deps: comma-separated row ids, or - for none.' \
-      '# hard_gate: 1 = the watcher stops before this row until `orch approve <id>`.' \
+      '# gate: 1 = the engine stops before this row until `orch approve <id>`.' \
       '# plan_path: relative to the workspace, e.g. PHASE_A/setup/PLAN.md' \
-      '# extra allowlist (optional 6th column): comma/space separated extra paths' \
+      '# extras (optional 6th column on): metadata tokens (res=, reviewer=, timeout=, prio=) or extra allowlist paths' \
       '#   this row may stage, on top of its own phase folder + report pack.' \
-      '# The watcher rescans this file every pass — appending rows live is SAFE.' \
+      '# The engine rescans this file every pass — appending rows live is SAFE.' \
       '' > "$dir/queue_A.tsv"
     echo "wrote $dir/queue_A.tsv (empty ladder)"
   fi
@@ -135,13 +184,24 @@ WRAP
   if [[ -n $preset ]]; then
     local src="$ORCH_HOME/templates/presets/$preset"
     [[ -d $src ]] || { echo "no preset '$preset' in $ORCH_HOME/templates/presets"; exit 1; }
-    cp -n "$src"/* "$dir/prompts/" 2>/dev/null || true
+    local f
+    for f in "$src"/_* "$src/README.md"; do
+      [[ -f $f && ! -e $dir/prompts/$(basename "$f") ]] && cp "$f" "$dir/prompts/"
+    done
     echo "copied preset '$preset' into $dir/prompts/ (edit freely — instance copies win over framework defaults)"
+    if [[ $fresh == 1 && -f $src/setup.defaults.yaml ]]; then
+      ORCH_INSTANCE="$dir" python3 "$LIB/setup.py" defaults --preset "$preset" || exit 1
+    fi
   fi
+  ORCH_INSTANCE="$dir" python3 "$LIB/setup.py" rules ${preset:+--preset "$preset"} || exit 1
+  ORCH_INSTANCE="$dir" python3 "$LIB/setup.py" card || exit 1
   echo
   echo "instance ready: $dir"
-  echo "next:  orch lint     (validate the ladder)"
-  echo "       orch start    (bring the watchers up in tmux)"
+  echo "next:  orch setup questions   (the behaviour switches; answer with orch setup apply --answer id=option)"
+  echo "       fill rules/BASE.md      (every TODO(setup))"
+  echo "       orch setup check && orch setup card"
+  echo "       then plan a round: $ORCH_HOME/docs/PLANNING_AGENT_GUIDE.md"
+  echo "(an agent doing this follows $ORCH_HOME/docs/SETUP_AGENT_GUIDE.md)"
 }
 
 # --- bot daemon ------------------------------------------------------------
@@ -170,29 +230,47 @@ bot(){
 }
 
 cmd="${1:-}"; shift || true
+CTL="$LIB/orchctl.py"
 case "$cmd" in
   init)        do_init "$@" ;;
+  setup)       exec python3 "$LIB/setup.py" "$@" ;;
   status)      python3 "$LIB/state_resolver.py" $( [[ "${1:-}" == full ]] && echo --full ) ;;
   json)        python3 "$LIB/state_resolver.py" --json ;;
   lint)        python3 "$LIB/lint.py" ;;
+  preflight)   exec python3 "$LIB/preflight.py" "$@" ;;
+  report)      exec python3 "$LIB/report.py" "$@" ;;
+  round)       exec python3 "$LIB/rounds.py" "$@" ;;
+  archive)     exec python3 "$LIB/rounds.py" archive "$@" ;;
+  score)       exec python3 "$LIB/rounds.py" score "$@" ;;
+  gd)          exec python3 "$LIB/decisions.py" "$@" ;;
   dashboard)   python3 "$LIB/dashboard_tui.py" "$@" ;;
   monitor)     python3 "$LIB/monitor_tui.py" "$@" ;;
   bot)         bot "$@" ;;
   notify)      python3 "$LIB/telegram_bot.py" push --title "${1:-test}" --body "${2:-}" --force ;;
-  prompt)      exec "$CORE" prompt "$1" ;;   # regenerate a row's work order
   closecheck)  exec python3 "$LIB/close_check.py" "${1:?usage: orch closecheck <id>}" ;;
+  service)     exec python3 "$LIB/service.py" "$@" ;;
+  steward)     exec python3 "$LIB/steward.py" "$@" ;;
+  inbox)       exec python3 "$LIB/steward.py" inbox "$@" ;;
+  park|unpark) exec python3 "$LIB/steward.py" "$cmd" "$@" ;;
+  sw)          exec python3 "$LIB/steward.py" sw "$@" ;;
+  executor)    exec python3 "$LIB/fallback.py" "$@" ;;
+  row)         exec python3 "$LIB/rowadd.py" "$@" ;;
+  revert)      exec python3 "$LIB/revert.py" "$@" ;;
+  why)         exec python3 "$LIB/why.py" "$@" ;;
+  digest)      exec python3 "$LIB/digest.py" "$@" ;;
+  spend)       exec python3 "$LIB/spend.py" "$@" ;;
+  phase)       exec python3 "$LIB/phases.py" "$@" ;;
   longrun)     exec "$LIB/longrun.sh" longrun "$@" ;;
   venvcheck)   exec "$LIB/longrun.sh" venvcheck "$@" ;;
-  attach)      eval "$(cfg_sh)"; exec tmux attach -t "$ORCH_TMUX" ;;
-  watch)       exec "$CORE" watch ;;   # detachable desktop viewer window
+  attach)      eval "$(cfg_sh)"; exec tmux ${ORCH_TMUX_SOCKET:+-L "$ORCH_TMUX_SOCKET"} attach -t "$ORCH_TMUX" ;;
   # guard surfaces
   hold)        exec "$GUARD" hold "$@" ;;
   commit)      exec "$GUARD" commit "$@" ;;
   guard)       exec "$GUARD" "$@" ;;
   # engine surfaces
-  start|run|launch|dispatch|assign|assignments|done|blocked|approve|reset|adopt|lease|day|night|pause|resume|stop|unstop)
-               exec "$CORE" "$cmd" "$@" ;;
-  version)     echo "orch 1.0.0 (standalone orchestration framework) — $ORCH_HOME" ;;
+  start|night|day|pause|resume|stop|unstop|disable|assign|assignments|approve|dispatch|done|blocked|escalate|verdict|reset|rearm|adopt|prompt|lease|engine|migrate)
+               exec python3 "$CTL" "$cmd" "$@" ;;
+  version)     echo "orch 2.0.0 — $ORCH_HOME @ $(git -C "$ORCH_HOME" rev-parse --short HEAD 2>/dev/null)$( [[ -n $(git -C "$ORCH_HOME" status --porcelain 2>/dev/null | grep -v __pycache__) ]] && echo ' (dirty)')" ;;
   ""|help|-h|--help) usage ;;
   *)           echo "unknown command '$cmd'"; echo; usage; exit 1 ;;
 esac

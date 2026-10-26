@@ -1,14 +1,42 @@
-# A lead tier on Claude Code, scoped tiers on cheaper models.
+# A hard tier on Claude Code, junior tiers on cheaper models, and one
+# independent reviewer on a different executor before a row counts.
+# Merge these keys into your instance's orch.yaml.
 executors:
   default: "opus"
-  allowed: [opus, sonnet, hermes, opencode, manual, mock]
+  allowed: [opus, sonnet, haiku, opencode, gemini, manual, mock]
   flavors:
-    opencode: scoped             # (the default) follow the plan exactly, block on decisions
+    opencode: jrdev            # (the default) follow the plan exactly, block on decisions
+    gemini: jrdev
   arg_kick: [opencode]
-  paste_kick: [hermes]
   models:
-    opencode: "deepseek-chat"    # example scoped-tier model
-    opencode_provider: "deepseek"
-  unblock_executor: "sonnet"     # an unblocker needs judgment: use a lead-tier model
-  auto_unblock: [hermes, opencode]
+    haiku: "claude-haiku-latest"   # example pin; remove to use the CLI's default
+  unblock_executor: "sonnet"
+  unblock_executors: [sonnet, opus]   # a Sonnet ESCALATE goes to Opus before it pages
+  unblock_ladder: true
+  auto_unblock: [haiku, opencode, gemini]
   retier_on_max_unblock: "opus"
+  max_unblock_attempts: 2
+  args:
+    opus: ["--effort", "high"]
+    sonnet: ["--effort", "high"]
+
+review:
+  policy: junior               # review the cheap tiers; hard-tier rows claim for themselves
+  default_reviewer: "sonnet"
+  fallback_reviewer: "opus"
+  reviewer_map: {haiku: sonnet, opencode: sonnet, gemini: sonnet, sonnet: opus, opus: sonnet}
+  require_different_executor: true
+  on_reject: redispatch
+  max_rejects: 2
+
+scheduler:
+  mode: dag
+  max_parallel: 8
+  min_free_mb: 3072
+
+# A second executor on OpenCode's adapter, pinned to one model. Declared here,
+# allowed without being listed in executors.allowed, and inheritable in every
+# place the base is (flavor, review map, unblock lists, health probes).
+# executors:
+#   variants:
+#     opencode_gemini: {base: opencode, model: "google/gemini-2.5-pro", max_parallel: 3}

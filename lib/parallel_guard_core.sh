@@ -3,7 +3,7 @@
 #
 # It does NOT stop sessions overlapping. It stops them overlapping *on a
 # resource*, and it stops one session staging another session's half-finished
-# work. Generalized from an earlier guard; the 70-line
+# work. Generalized from the earlier per-lane guard; the 70-line
 # hand-maintained `case` allowlist is gone — the allowlist is now DERIVED
 # (see state_resolver.allowlist).
 #
@@ -12,6 +12,7 @@
 #   orch commit <id> -m "msg" -- <path>...
 #   orch guard start|finish <id>
 #   orch guard allowlist <id>
+#   orch guard protected                     (the Owner's paths, lib/protected.py)
 #   orch guard force-release <resource>      (operator only)
 #
 # `hold` acquires, runs, and releases EVEN IF the command fails or is killed:
@@ -37,31 +38,67 @@ export ORCH_INSTANCE
 
 die(){ echo "REFUSED: $*" >&2; exit 1; }
 lease_owner(){ head -1 "$LEASES/$1.lock/owner" 2>/dev/null || true; }
-allow_paths(){ python3 "$ORCH_LIB/state_resolver.py" --allowlist "$1"; }
+allow_paths(){
+  if planning "$1"; then [[ -n $ORCH_REPO_PREFIX ]] && echo "$ORCH_REPO_PREFIX" || echo "."; return; fi
+  python3 "$ORCH_LIB/state_resolver.py" --allowlist "$1"
+}
 
+# Leases go through lib/leases.py (v2): slots, host-scope resources shared by every
+# rig on the machine, stale-holder reclaim, and the same owner files the engine reads.
 acquire(){ # resource id -> 0 acquired by this call, 10 already held by <id> (re-entrant)
-  local r=$1 id=$2 waited=0 lock="$LEASES/$1.lock"
-  if [[ -d $lock && $(lease_owner "$r") == "$id" ]]; then
-    echo "[guard] '$r' already held by $id — re-entrant, left held for the enclosing span"
-    return 10
-  fi
-  until mkdir "$lock" 2>/dev/null; do
-    echo "$(date '+%F %T') [guard] '$r' held by $(lease_owner "$r") — $id waiting ${waited}s"
-    sleep 15 & wait $!; waited=$((waited+15))   # interruptible: a signal is handled at once
-    if (( waited % 300 == 0 )); then
-      echo "[guard] still waiting after ${waited}s. If the holder died:"
-      echo "        orch guard status — a stale lease is released with"
-      echo "        orch guard force-release $r, and only by the operator."
-    fi
-  done
-  printf '%s\n%s\n%s\n' "$id" "$(date '+%F %T')" "$$" > "$lock/owner"
-  echo "[guard] '$r' ACQUIRED by $id"
+  python3 "$ORCH_LIB/leases.py" acquire "$2" "$1" --pid $$ --wait
 }
 release(){ # resource id
-  local r=$1 id=$2 cur; cur=$(lease_owner "$r")
-  [[ -z "$cur" ]] && return 0
-  [[ "$cur" == "$id" ]] || { echo "[guard] not releasing '$r' — owner is '$cur', not '$id'" >&2; return 0; }
-  rm -rf "${LEASES:?}/$r.lock"; echo "[guard] '$r' RELEASED by $id"
+  python3 "$ORCH_LIB/leases.py" release "$2" "$1" >/dev/null
+  echo "[guard] '$1' RELEASED by $2"
+}
+
+# A path is inside an allowlist entry only on a path boundary (v1 compared bare
+# prefixes, so `PHASE_A/a1` also admitted `PHASE_A/a10/…`). Entries ending in `_`
+# (a row's report-pack prefix, REPORTS/<id>_) or `/` are prefixes by design.
+in_allow(){ # path allowlist-lines -> 0 inside
+  local rp=$1 a
+  while read -r a; do
+    [[ -z $a ]] && continue
+    if [[ $rp == "$a" || $rp == "$a"/* ]]; then return 0; fi
+    if [[ $a == *_ || $a == */ ]] && [[ $rp == "$a"* ]]; then return 0; fi
+  done <<< "$2"
+  return 1
+}
+# Planning commits (`orch commit plan:<tag> …`) may stage anything in the
+# workspace except the rig's live state; they still pass the scanners and git-lock.
+planning(){ [[ $1 == plan:* ]]; }
+# v3 (lib/capability.py, guard.capability_check): a process that descends from a session's pane
+# IS that session, whatever ORCH_ROW / ORCH_KIND say — an unset or borrowed id is replaced by the
+# pane's own before any check reads it, so "operator" means: outside every session of this rig.
+CAP_OFF=0
+session_identity(){
+  local who rc=0
+  who=$(python3 "$ORCH_LIB/capability.py" who) || rc=$?
+  (( rc == 2 )) && CAP_OFF=1                       # guard.capability_check: false — v2 behaviour
+  (( rc == 3 )) && echo "[guard] ⚠  the capability check failed (above) — the environment decides" >&2
+  (( rc == 0 )) && [[ -n $who ]] || return 0
+  if [[ ${ORCH_ROW:-} != "${who%% *}" ]]; then
+    echo "[guard] this process descends from session ${who%% *}'s pane (ORCH_ROW='${ORCH_ROW:-}') — acting as ${who%% *}" >&2
+  fi
+  ORCH_ROW=${who%% *}; who=${who#* }; ORCH_KIND=${who%% *}
+  export ORCH_ROW ORCH_KIND
+}
+in_session(){ [[ -n ${ORCH_ROW:-} || -n ${ORCH_KIND:-} ]]; }
+operator_overrides(){ # the operator's switches refuse inside a session (v2 allowed them: check off)
+  local v
+  (( CAP_OFF )) && return 0
+  for v in ORCH_SCANNER_OVERRIDE ORCH_SHARED_WHOLE; do
+    [[ ${!v:-} == 1 ]] && in_session && die "$v=1 is the operator's override; session ${ORCH_ROW:-?} may not use it.
+       A commit that needs it is the operator's: say so in PROGRESS.md and block (or escalate)."
+  done
+  return 0
+}
+rig_private(){ # repo-relative path -> 0 when it is the instance's live state
+  local inst_rel="${ORCH_INSTANCE#"$ORCH_GIT_REPO"/}"
+  [[ $inst_rel == "$ORCH_INSTANCE" ]] && return 1
+  case $1 in "$inst_rel"/state/*|"$inst_rel"/control/*|"$inst_rel"/leases/*) return 0 ;; esac
+  return 1
 }
 
 cmd_status(){
@@ -72,15 +109,12 @@ cmd_status(){
   done
   (( any )) || echo "  (none registered)"
   echo; echo "=== resource leases ==="
-  for r in $ORCH_RESOURCES; do
-    if [[ -d "$LEASES/$r.lock" ]]; then
-      printf "  %-14s HELD by %-12s since %s\n" "$r" "$(sed -n 1p "$LEASES/$r.lock/owner")" "$(sed -n 2p "$LEASES/$r.lock/owner")"
-    else printf "  %-14s free\n" "$r"; fi
-  done
+  python3 "$ORCH_LIB/leases.py" status
 }
 
 cmd_start(){
   local id=${1:?usage: guard start <id>} p
+  planning "$id" && die "planning ids need no registration — commit with: orch commit $id -m \"msg\" -- <paths>"
   [[ -n "$(allow_paths "$id")" ]] || die "'$id' resolves to an empty allowlist — is it in a queue_*.tsv with a plan path?"
   printf '%s\n%s\n' "$(date '+%F %T')" "$$" > "$RUNNING/$id.run"
   echo "[guard] session '$id' registered."; echo
@@ -98,7 +132,7 @@ cmd_finish(){
 HOLD_ID=""; HOLD_GOT=()
 hold_release_all(){ local r; for r in "${HOLD_GOT[@]}"; do release "$r" "$HOLD_ID"; done; HOLD_GOT=(); }
 cmd_hold(){ # id resource[,resource...] -- command...
-  local id=${1:?} spec=${2:?} r arc; shift 2
+  local id=${1:?} spec=${2:?} r arc=0; shift 2
   [[ "${1:-}" == "--" ]] || die "usage: hold <id> <resource>[,<resource>...] -- <command...>"
   shift
   local -a want=()
@@ -109,6 +143,7 @@ cmd_hold(){ # id resource[,resource...] -- command...
     [[ " $ORCH_RESOURCES " == *" $r "* ]] || die "unknown resource '$r' (have: $ORCH_RESOURCES)"
   done
   (( $# )) || die "no command given to hold"
+  arc=0
   HOLD_ID=$id; HOLD_GOT=()
   # A signal ENDS the hold: release what was taken, then exit. A handler that
   # returned would let a killed wait loop keep waiting, or a killed command's
@@ -116,10 +151,12 @@ cmd_hold(){ # id resource[,resource...] -- command...
   trap 'hold_release_all' EXIT
   trap 'hold_release_all; exit 130' INT
   trap 'hold_release_all; exit 143' TERM
-  for r in "${want[@]}"; do
-    arc=0; acquire "$r" "$id" || arc=$?
-    (( arc == 0 )) && HOLD_GOT+=( "$r" )
-  done
+  # all-or-nothing: nothing is held while waiting for the rest
+  local out newly
+  out=$(python3 "$ORCH_LIB/leases.py" acquire "$id" "$(IFS=,; echo "${want[*]}")" --pid $$ --wait | tee /dev/stderr) || arc=$?
+  newly=$(printf '%s\n' "$out" | sed -n 's/^\[lease\] \(.*\) ACQUIRED by .*/\1/p' | tail -1)
+  [[ -n $newly ]] && IFS=',' read -ra HOLD_GOT <<< "$newly"
+  if [[ ${arc:-0} != 0 && ${arc:-0} != 10 ]]; then die "could not take ${want[*]}"; fi
   "$@"; local rc=$?
   trap - EXIT INT TERM
   hold_release_all
@@ -136,7 +173,17 @@ cmd_commit(){ # id -m msg -- path...
   [[ "${1:-}" == "--" ]] || die "usage: commit <id> -m \"msg\" -- <path>..."
   shift
   (( $# )) || die "no paths given"
+  session_identity
+  operator_overrides
 
+  if planning "$id" && [[ -n ${ORCH_ROW:-} ]] && [[ ${ORCH_ROW} != "pl-${id#plan:}-"* ]]; then
+    die "planning commits ($id) come from the operator's shell or the planner session of that round (pl-${id#plan:}-<n>), not from session ${ORCH_ROW}"
+  fi
+  # (a planner session pl-<tag>-<n> commits as plan:<tag>, checked just above)
+  if [[ -n ${ORCH_ROW:-} && $id != "$ORCH_ROW" ]] && ! { [[ $ORCH_ROW == ub-* ]] && [[ $ORCH_ROW == "ub-$id-"* ]]; } \
+     && ! { planning "$id" && [[ $ORCH_ROW == "pl-${id#plan:}-"* ]]; }; then
+    die "session ${ORCH_ROW} may commit only as itself (or as the row it unblocks), never as '$id'"
+  fi
   local allow; allow=$(allow_paths "$id")
   [[ -n "$allow" ]] || die "'$id' has no resolvable allowlist"
   # Accept paths written repo-relative OR project-root-relative; compare both.
@@ -148,7 +195,8 @@ cmd_commit(){ # id -m msg -- path...
     local repo_from_root="${ORCH_GIT_REPO#"$ORCH_ROOT"/}"
     [[ -n $repo_from_root && $rp == "$repo_from_root"/* ]] && rp="${rp#"$repo_from_root"/}"
     ok=0
-    while read -r a; do [[ -n $a && $rp == "$a"* ]] && ok=1; done <<< "$allow"
+    if planning "$id"; then rig_private "$rp" || ok=1; [[ $allow == "." ]] || in_allow "$rp" "$allow" || ok=0
+    else in_allow "$rp" "$allow" && ok=1; fi
     (( ok )) || die "'$p' is outside $id's allowlist — staging another session's files is how work gets lost.
        Allowlist:
 $(printf '         %s\n' $allow)"
@@ -193,7 +241,7 @@ $(printf '         %s\n' $allow)"
   local hs_rc
   for rp in "${shared[@]}"; do
     hs_rc=0
-    if [[ ${ORCH_SHARED_WHOLE:-} == 1 ]]; then
+    if [[ ${ORCH_SHARED_WHOLE:-} == 1 ]] || planning "$id"; then
       echo "[guard] ⚠  ORCH_SHARED_WHOLE=1 — staging the whole of shared path '$rp' (on the record: say so in the message)."
       git add -- "$rp" || hs_rc=2
     else
@@ -207,18 +255,53 @@ $(printf '         %s\n' $allow)"
   done
   # Compare the REAL name, never the C-quoted one: non-ASCII
   # filenames otherwise fail every pack commit.
-  local staged s; staged=$(git -c core.quotepath=false diff --cached --name-only)
+  # --no-renames: a staged rename lists its source too (a `git mv` out of a protected or another
+  # row's path would otherwise show only its destination)
+  local staged s; staged=$(git -c core.quotepath=false diff --cached --name-only --no-renames)
   while IFS= read -r s; do
     [[ -z "$s" ]] && continue
     ok=0
-    while read -r a; do [[ -n $a && $s == "$a"* ]] && ok=1; done <<< "$allow"
+    if planning "$id"; then rig_private "$s" || ok=1; [[ $allow == "." ]] || in_allow "$s" "$allow" || ok=0
+    else in_allow "$s" "$allow" && ok=1; fi
     (( ok )) || { git reset -q; die "the index carried '$s', outside $id's allowlist — nothing committed, index reset"; }
   done <<< "$staged"
+
+  # --- protected paths (v3, lib/protected.py) -------------------------------
+  # Scorers, gates, keys, caps, phases, the rights table: only the operator's own
+  # `plan:` commit (no session identity, never the engine's plan:engine) stages them.
+  local -a staged_arr=()
+  mapfile -t staged_arr < <(printf '%s\n' "$staged" | sed '/^$/d')
+  local prot="" prc=0 operator=0
+  planning "$id" && [[ $id != plan:engine ]] && ! in_session && operator=1
+  if (( ${#staged_arr[@]} )); then
+    prot=$(printf '%s\n' "${staged_arr[@]}" | python3 "$ORCH_LIB/protected.py" match -) || prc=$?
+  fi
+  local -a prot_paths=()
+  [[ -n $prot ]] && mapfile -t prot_paths < <(printf '%s\n' "$prot" | cut -f1)
+  if (( prc == 3 )); then
+    if (( operator )); then
+      # only what the operator named: a protected file someone else left staged is not swept in
+      local pp named
+      for pp in "${prot_paths[@]}"; do
+        named=0
+        for rp in "${rel[@]}"; do [[ $pp == "$rp" || $pp == "${rp%/}"/* ]] && named=1; done
+        (( named )) || { git reset -q; die "the index carried protected path '$pp', which this commit did not name — nothing committed, index reset (stage the Owner's files by naming them)"; }
+      done
+      echo "[guard] operator commit of protected path(s): ${prot_paths[*]}"
+    else
+      git reset -q
+      die "'$id' may not stage a protected path (the Owner's: guard.protected_paths + the automatic set) — nothing committed, index reset:
+$(printf '%s\n' "$prot" | sed 's/^/         /; s/\t/   (pattern: /; s/$/)/')
+       Only the operator's own plan: commit changes these; a row that needs one changed escalates (Route A)."
+    fi
+  elif (( prc != 0 )); then
+    git reset -q; die "the protected-path check failed (exit $prc) — nothing committed, index reset"
+  fi
 
   # --- pluggable compliance scanners -------------------------------------
   # Each configured scanner is called as:  <scanner> --check <file>...
   # over COPIES of the staged blobs (content, not paths). Non-zero exit =
-  # refuse. This is where a project puts its client-material / secret /
+  # refuse. This is where a project puts its private / secret /
   # licence checks; the framework ships none.
   local hit=0
   if [[ -n "${ORCH_SCANNERS// }" ]]; then
@@ -250,22 +333,33 @@ $(printf '         %s\n' $allow)"
     else
       git reset -q
       die "staged content was refused by a compliance scanner (above) — nothing committed, index reset.
-       A legitimate exception needs ORCH_SCANNER_OVERRIDE=1 and a sentence in the commit message."
+       A legitimate exception is the operator's: ORCH_SCANNER_OVERRIDE=1 from the operator's shell and a sentence in the commit message."
     fi
   fi
 
   git commit -q -m "$msg" && echo "[guard] committed: $(git log --oneline -1)"
   local rc=$?
+  # Every operator plan: commit is recorded: the close check never charges it to a row, and an
+  # Owner ruling committed this way is one a protected-path close may cite (lib/protected.py).
+  if (( rc == 0 && operator )); then
+    python3 "$ORCH_LIB/protected.py" record "$(git rev-parse HEAD)" "$id" ${prot_paths[@]+"${prot_paths[@]}"} \
+      || echo "[guard] ⚠  could not record this operator commit in state/protected_commits.jsonl"
+  fi
   trap - EXIT INT TERM
   (( own_lock )) && release "$held" "$id"
   return $rc
 }
 
 cmd_force_release(){
-  local r=${1:?usage: guard force-release <resource>}
-  echo "Holder was: $(lease_owner "$r")"
+  local r=${1:?usage: guard force-release <resource>} d
+  session_identity
+  in_session && die "\`orch guard force-release\` is the operator's call; session ${ORCH_ROW:-?} may not run it"
+  python3 "$ORCH_LIB/leases.py" status | grep -F " $r " || true
   echo "This is the operator's call, not an executor's. Ctrl-C now if that holder is alive."
-  sleep 5; rm -rf "${LEASES:?}/$r.lock"; echo "[guard] '$r' force-released."
+  sleep 5
+  for d in "$LEASES/$r.lock" "$LEASES/$r#"*.lock "$HOME/.local/state/orch/leases/$r.lock" "$HOME/.local/state/orch/leases/$r#"*.lock; do
+    [[ -d $d ]] && rm -rf "$d" && echo "[guard] '$(basename "$d")' force-released."
+  done
 }
 
 case "${1:-}" in
@@ -273,6 +367,7 @@ case "${1:-}" in
   start)         cmd_start "${2:-}" ;;
   finish)        cmd_finish "${2:-}" ;;
   allowlist)     cmd_allowlist "${2:-}" ;;
+  protected)     python3 "$ORCH_LIB/protected.py" list ;;
   hold)          shift; cmd_hold "$@" ;;
   commit)        shift; cmd_commit "$@" ;;
   force-release) cmd_force_release "${2:-}" ;;

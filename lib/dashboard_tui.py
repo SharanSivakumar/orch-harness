@@ -46,11 +46,11 @@ except ImportError:                             # pragma: no cover
 STATE_STYLE = {
     "CLOSED": "dim green", "RUNNING": "bold cyan", "UNBLOCKING": "bold magenta",
     "QUIET": "yellow", "ORPHAN": "bold red",
-    "GATED": "bold yellow", "WAITING": "yellow", "PENDING": "white",
+    "GATED": "bold yellow", "SPEND_WAIT": "bold yellow", "WAITING": "yellow", "PENDING": "white",
     "PAUSED": "dim yellow", "MANUAL": "bold blue",
-    "BLOCKED": "bold red", "ESCALATED": "bold red", "HALTED": "bold red",
+    "BLOCKED": "bold red", "ROUTE_A": "bold red", "HALTED": "bold red",
 }
-ATTENTION = {"BLOCKED", "ESCALATED", "HALTED", "ORPHAN", "GATED", "MANUAL"}
+ATTENTION = {"BLOCKED", "ROUTE_A", "HALTED", "ORPHAN", "GATED", "MANUAL", "SPEND_WAIT"}
 LIVE = {"RUNNING", "UNBLOCKING", "QUIET"}
 
 
@@ -142,7 +142,7 @@ def current_pipeline(snap: Dict[str, Any], lanes_filter: List[str]) -> Panel:
             why = f"open prompts/{row['id']}.manual.md"
         elif state == "ORPHAN":
             why = f"close or adopt {row['id']}"
-        elif state in {"BLOCKED", "ESCALATED", "HALTED"}:
+        elif state in {"BLOCKED", "ROUTE_A", "HALTED"}:
             why = row["note"] or lv["headline"]
         elif state == "QUIET":
             why = f"quiet {max(0, row['idle_secs']) // 60}m"
@@ -342,7 +342,7 @@ def attention_panel(snap: Dict[str, Any]) -> Panel:
     lines: List[Text] = []
     for lv in snap["lanes"]:
         for r in lv["rows"]:
-            if r["state"] in ("BLOCKED", "ESCALATED", "HALTED"):
+            if r["state"] in ("BLOCKED", "ROUTE_A", "HALTED"):
                 lines.append(Text(f"  ⛔ {r['id']} {r['state']} — {r['note'][:90]}", style="bold red"))
             elif r["state"] == "GATED":
                 lines.append(Text(f"  ⏸  {r['id']} awaiting gate — orch approve {r['id']}", style="bold yellow"))
@@ -375,7 +375,7 @@ def events_panel(res: Resolver, snap: Dict[str, Any], n: int = 1) -> Panel:
         except Exception:
             continue
     rows.sort(key=lambda r: r[0])
-    t = Table(box=box.SIMPLE, expand=True, show_header=False, pad_edge=False)
+    t = Table(box=None, expand=True, show_header=False, pad_edge=False, padding=0)
     t.add_column(width=8, style="dim"); t.add_column(width=3)
     t.add_column(overflow="ellipsis", no_wrap=True)
     for ts, lane, msg in rows[-n:]:

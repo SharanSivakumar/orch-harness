@@ -1,0 +1,1 @@
+UNATTENDED reminder from the orchestration engine: nobody answers in this window. Finish your analysis in unblock/, then record your verdict with: __VERDICTCMD__ (RESOLVED or ESCALATE). Then make no further tool calls.

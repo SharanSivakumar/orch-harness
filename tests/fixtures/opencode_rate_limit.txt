@@ -1,0 +1,2 @@
+  Rate limit exceeded. Please try again later.
+  {"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}

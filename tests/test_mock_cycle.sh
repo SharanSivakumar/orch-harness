@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# test_mock_cycle.sh — end-to-end integration test in an isolated sandbox.
+# test_mock_cycle.sh — guard, CLI and adapter checks in an isolated sandbox (v2).
+#
+# The engine paths (dispatch, chaining, gates, unblock, review, seal, dead windows,
+# orphans, capacity, resources) moved to tests/test_v2_engine.py with the v2
+# engine; this script keeps the guard, close-check, longrun, preset and adapter
+# sections, which run without an engine.
 #
 # Builds a throwaway project (its own git repo, its own tmux session, its own
 # instance directory) under a temp dir, runs a real multi-lane ladder through
@@ -9,7 +14,7 @@
 #   1. init + lint on a fresh instance
 #   2. dispatch -> visible tmux window -> sentinel -> auto-chain
 #   3. dependency gating across lanes
-#   4. approval gates (GO_) and `orch approve`
+#   4. hard gates (GO_) and `orch approve`
 #   5. runtime retiering with `orch assign`
 #   6. the convention-based guard allowlist: inside passes, outside REFUSED
 #   7. compliance-scanner refusal + explicit override
@@ -23,7 +28,7 @@
 #      auto-seals a finished session that never wrote its sentinel; free text
 #      is never a verdict, and an existing sentinel is never overwritten
 #  15. watcher liveness is scoped to THIS instance: another rig's watcher on
-#      the same lane letter never counts as ours 
+#      the same lane letter never counts as ours
 #  16. every work order a preset renders carries the never-open clause
 #  17. `orch done` refuses a CLOSED over the row's own stop line unless a
 #      signed ruling is named
@@ -40,12 +45,23 @@
 #   tests/test_mock_cycle.sh            # run, clean up on success
 #   KEEP=1 tests/test_mock_cycle.sh     # keep the sandbox for inspection
 set -u
+# every tmux session of this suite lives on a PRIVATE server: its own TMUX_TMPDIR, no inherited $TMUX
+# (a shell started inside a tmux pane has it, and tmux then talks to that pane's server), its own -L name
+TMUX_PRIV="$(mktemp -d "${TMPDIR:-/tmp}/otm-XXXXXX")"
+export TMUX_TMPDIR="$TMUX_PRIV"
+unset TMUX ORCH_TMUX_SOCKET
 
 HOME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ORCH="$HOME_DIR/bin/orch"
 SBX="$(mktemp -d "${TMPDIR:-/tmp}/orch-sandbox-XXXXXX")"
 SESSION="orchtest$$"
 PASS=0; FAIL=0
+# no real agent CLI can start from this suite: stubs shadow every model binary
+mkdir -p "$SBX/stubs"
+for b in claude opencode codex gemini; do
+  printf '#!/bin/sh\necho "test stub: $0 refused"; exit 97\n' > "$SBX/stubs/$b"; chmod +x "$SBX/stubs/$b"
+done
+export PATH="$SBX/stubs:$PATH"
 
 ok(){   PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m  %s\n' "$*"; }
 bad(){  FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m  %s\n' "$*"; }
@@ -56,6 +72,7 @@ DECOY=""
 cleanup(){
   [[ -n $DECOY ]] && kill "$DECOY" 2>/dev/null
   tmux kill-session -t "$SESSION" 2>/dev/null
+  rm -rf "$TMUX_PRIV"
   if [[ ${KEEP:-0} == 1 ]]; then echo; echo "sandbox kept: $SBX"
   else rm -rf "$SBX"; fi
 }
@@ -83,10 +100,11 @@ import sys, pathlib, re
 f = pathlib.Path(sys.argv[1]); t = f.read_text()
 t = t.replace('root: "../../.."', 'root: ".."')          # project root = the cycle folder
 t = t.replace('default: "opus"', 'default: "mock"')
-t = t.replace('retier_on_max_unblock: "opus"', 'retier_on_max_unblock: "mock"')
-t = t.replace('unblock_executor: "hermes"', 'unblock_executor: "mock"')
-t = t.replace('models: {}', 'models: {}\n  flavors: {mock: scoped}')
-t = t.replace('paste_kick: [hermes, hermespro]', 'paste_kick: []')
+# rows run on a junior mock; unblockers and the retier target are a hard mock (a junior never decides)
+t = t.replace('retier_on_max_unblock: "opus"', 'retier_on_max_unblock: "mockhard"')
+t = t.replace('unblock_executor: "sonnet"', 'unblock_executor: "mockhard"')
+t = t.replace('models: {}', 'models: {}\n  flavors: {mock: jrdev, mockhard: hard}\n  adapters: {mockhard: mock}')
+t = re.sub(r'allowed: \[([^\]]*)\]', lambda m: f'allowed: [{m.group(1)}, mockhard]', t, count=1)
 t = t.replace('poll_interval: 60', 'poll_interval: 2')
 t = t.replace('compliance_scanners: []', 'compliance_scanners: ["scan.py"]')
 t = t.replace('    - "git-lock"\n  compliance', '    - "git-lock"\n    - "tree-a"\n    - "tree-b"\n  compliance')
@@ -160,7 +178,7 @@ fi
 ORCH_SCANNER_OVERRIDE=1 "$ORCH" commit a1 -m "leak, on the record" -- PHASE_A/a1/leak.txt >/dev/null 2>&1 \
   && ok "ORCH_SCANNER_OVERRIDE=1 commits it explicitly" || bad "override did not work"
 
-note "4b. a shared path is staged hunk by hunk "
+note "4b. a shared path is staged hunk by hunk"
 DEC="$SBX/project/cycle/DECISIONS.md"
 printf '# decisions\n\n## one\n\n## two\n' > "$DEC"
 git -C "$SBX/project/cycle" add DECISIONS.md && git -C "$SBX/project/cycle" commit -qm "decisions skeleton"
@@ -207,216 +225,6 @@ timeout 5 "$ORCH" hold b1 tree-a -- true >/dev/null 2>&1; rc=$?
 "$ORCH" lease release tree-a a1 >/dev/null 2>&1
 [[ ! -d $INST/leases/tree-a.lock ]] && ok "the span's release frees the tree" || bad "the span's lease was not released"
 
-note "6. run both lanes end to end"
-printf 'CLOSED\na1 done\n' > "$INST/control/MOCK_a1"
-printf 'CLOSED\na2 done\n' > "$INST/control/MOCK_a2"
-printf 'CLOSED\na3 done\n' > "$INST/control/MOCK_a3"
-printf 'BLOCKED\na4 needs a decision the plan does not make\n' > "$INST/control/MOCK_a4"
-printf 'CLOSED\nb1 done\n' > "$INST/control/MOCK_b1"
-printf 'CLOSED\nb2 done\n' > "$INST/control/MOCK_b2"
-for n in 1 2 3; do printf 'RESOLVED\nplan amended (attempt %s)\n' "$n" > "$INST/control/MOCK_ub-a4-$n"; done
-# A FOREIGN instance's watcher on the same lane letter. Lane letters
-# repeat across rigs, and a live rig on this host runs its own `watch-A`; a bare
-# process-name match read it as this sandbox's watcher, so `orch start` skipped
-# lane A and nothing ran. The decoy makes that collision deterministic here.
-mkdir -p "$SBX/foreign/lib" "$SBX/foreign/inst"
-printf '%s\n' '#!/usr/bin/env bash' 'trap '"'"'kill $c 2>/dev/null; exit 0'"'"' TERM' 'sleep 900 & c=$!; wait' \
-  > "$SBX/foreign/lib/orchestrator_core.sh"
-ORCH_INSTANCE="$SBX/foreign/inst" bash "$SBX/foreign/lib/orchestrator_core.sh" run A </dev/null >/dev/null 2>&1 &
-DECOY=$!
-sleep 1
-"$ORCH" start >"$SBX/start.out" 2>&1
-grep -q "started watcher watch-A" "$SBX/start.out" \
-  && ok "a foreign instance's watcher on the same lane letter is not ours (lane A started)" \
-  || bad "orch start took a foreign instance's watcher for its own: $(grep watch-A "$SBX/start.out")"
-
-for i in $(seq 1 40); do [[ $(have a1) == CLOSED ]] && break; sleep 1; done
-[[ $(have a1) == CLOSED ]] && ok "a1 dispatched and closed itself" || bad "a1 never closed"
-for i in $(seq 1 40); do [[ $(have a2) == CLOSED ]] && break; sleep 1; done
-[[ $(have a2) == CLOSED ]] && ok "a2 auto-chained after its dependency" || bad "a2 did not chain"
-for i in $(seq 1 40); do [[ $(have b2) == CLOSED ]] && break; sleep 1; done
-[[ $(have b2) == CLOSED ]] && ok "lane B ran in parallel and completed" || bad "lane B did not complete"
-
-note "7. the approval gate holds until it is approved"
-sleep 4
-[[ -z "$(have a3)" ]] && ok "a3 is held at its approval gate (no sentinel)" || bad "a3 ran through its gate"
-"$ORCH" status | grep -qE "GATE HOLD before a3|GATED" && ok "status names the gate" || bad "status does not show the gate"
-# The gated row's declared pre-dispatch probe: approved, but its
-# prerequisite is absent, so the watcher must not dispatch it — and must say so.
-printf 'a3\ttest -f %s\n' "$SBX/probe_ok" > "$INST/gate_probes.tsv"
-"$ORCH" approve a3 >/dev/null
-sleep 6
-[[ -z "$(have a3)" ]] && ! tmux list-windows -t "$SESSION" -F '#{window_name}' | grep -qx a3 \
-  && ok "an approved gated row whose probe fails is NOT dispatched" || bad "a3 was dispatched although its probe failed"
-grep -q "a3 pre-dispatch probe FAILED" "$INST/state/events_A.log" && grep -q "PROBE FAILED before a3" "$INST/state/lane_A.info" \
-  && ok "the probe failure is an event line and the lane banner" || bad "the probe failure was not reported"
-"$ORCH" dispatch a3 2>&1 | grep -q "pre-dispatch probe failed" \
-  && ok "orch dispatch refuses a gated row whose probe fails" || bad "orch dispatch ignored the failing probe"
-touch "$SBX/probe_ok"
-for i in $(seq 1 40); do [[ $(have a3) == CLOSED ]] && break; sleep 1; done
-[[ $(have a3) == CLOSED ]] && ok "orch approve released the gate and a3 ran" || bad "a3 did not run after approve"
-grep -q "a3 pre-dispatch probe PASSES again" "$INST/state/events_A.log" \
-  && ok "the lane dispatched by itself once the probe passed" || bad "no event line for the passing probe"
-
-note "7b. closing-line auto-seal ('said Closed then sat at the prompt' fix)"
-. "$HOME_DIR/lib/closing.sh"
-export ORCH_TMUX="$SESSION"
-# parser: verdict + summary extracted from the exact token line (em-dash separator)
-V=$(closing_verdict "ORCH_CLOSE c1 CLOSED — 240 rows stop printing a zero")
-[[ $V == CLOSED ]] && ok "closing_verdict parses CLOSED" || bad "verdict parse: got '$V'"
-S=$(closing_summary "ORCH_CLOSE c1 CLOSED — 240 rows stop printing a zero" CLOSED)
-[[ $S == "240 rows stop printing a zero" ]] && ok "closing_summary strips the token" || bad "summary parse: got '$S'"
-[[ -z $(closing_verdict "Closed. all done!") ]] && ok "free text is never read as a verdict" || bad "free text was read as a verdict"
-# regression: the work-order template's step-5 line is instruction
-# text, not a verdict. Its code span starts with a backtick and is quoted mid-line,
-# so it must never seal a row -- even when the prompt is still on the visible pane.
-TPL="\`ORCH_CLOSE c1 CLOSED — <the same one-sentence summary>\` (or \`BLOCKED\`/\`ESCALATED\`"
-[[ -z $(closing_line c1 "$TPL") ]] \
-  && ok "closing_line ignores template/instruction text (backtick-prefixed)" \
-  || bad "closing_line parsed template text as a closing line"
-# regression: the TUI rendered the same template line WITHOUT its
-# backticks, indented, so it matched the column-0 form and sealed a row that had
-# done nothing. A placeholder summary is never a verdict.
-TPL_RENDERED="     ORCH_CLOSE c1 CLOSED — <the same one-sentence summary> (verdict matching the sentinel)."
-[[ -z $(closing_line c1 "$TPL_RENDERED") ]] \
-  && ok "closing_line ignores the backtick-less rendered template line" \
-  || bad "closing_line parsed the rendered template line as a closing line"
-[[ $(closing_line c1 "$TPL_RENDERED"$'\n'"  ORCH_CLOSE c1 BLOCKED — rulings needed") == *"rulings needed" ]] \
-  && ok "a genuine closing line below the rendered template still reads" \
-  || bad "the rendered template masked a genuine closing line"
-[[ -n $(closing_line c1 "ORCH_CLOSE c1 BLOCKED — rulings needed") ]] \
-  && ok "closing_line still reads a genuine column-0 closing line" \
-  || bad "closing_line failed on a genuine closing line"
-# end to end: a live window whose pane shows ONLY the template line must NOT seal
-tmux new-window -d -t "$SESSION" -n c1tpl "printf '$TPL\\n'; sleep 300" 2>/dev/null
-sleep 2
-rm -f "$INST/state/c1tpl.status"
-ORCH_INSTANCE="$INST" seal_from_pane c1tpl
-[[ -z "$(have c1tpl)" ]] \
-  && ok "a pane showing only template text is NOT sealed" || bad "a template-only pane was wrongly sealed"
-tmux kill-window -t "$SESSION:c1tpl" 2>/dev/null
-# end to end: the REAL overdue-close case still seals -- a genuine closing line at
-# column 0 (possibly indented) is read as a verdict despite no sentinel file
-tmux new-window -d -t "$SESSION" -n c1 "printf 'ORCH_CLOSE c1 BLOCKED — rulings needed\\n'; sleep 300" 2>/dev/null
-sleep 2
-rm -f "$INST/state/c1.status"
-ORCH_INSTANCE="$INST" seal_from_pane c1
-[[ $(head -1 "$INST/state/c1.status" 2>/dev/null) == BLOCKED ]] \
-  && ok "pane seal wrote the BLOCKED sentinel" || bad "pane seal did not seal BLOCKED"
-[[ $(sed -n 2p "$INST/state/c1.status" 2>/dev/null) == "rulings needed" ]] \
-  && ok "pane seal captured the summary" || bad "pane seal summary wrong"
-# an already-written sentinel is never overwritten by the seal
-printf 'ESCALATED\na ruling is mandatory\n' > "$INST/state/c1.status"
-ORCH_INSTANCE="$INST" seal_from_pane c1
-grep -q '^ESCALATED$' "$INST/state/c1.status" \
-  && ok "seal never overwrites an existing sentinel" || bad "seal overwrote an existing sentinel"
-tmux kill-window -t "$SESSION:c1" 2>/dev/null
-
-note "8. the auto-unblock loop"
-for i in $(seq 1 90); do [[ -f "$INST/state/a4.blocked.1.status" ]] && break; sleep 1; done
-[[ -f "$INST/state/a4.blocked.1.status" ]] && ok "a4's BLOCKED verdict was archived (attempt 1)" \
-  || bad "no blocked archive for a4"
-[[ -f "$INST/BLOCK_SHEET.md" ]] && grep -q "a4" "$INST/BLOCK_SHEET.md" \
-  && ok "the block sheet logged the stop" || bad "block sheet missing or empty"
-ls "$INST/prompts"/ub-a4-1.*.md >/dev/null 2>&1 && ok "an unblocker work order was generated" \
-  || bad "no unblocker work order"
-for i in $(seq 1 30); do [[ -s "$INST/state/ub-a4-1.status" ]] && break; sleep 1; done
-[[ $(head -1 "$INST/state/ub-a4-1.status" 2>/dev/null) == RESOLVED ]] \
-  && ok "the unblocker returned RESOLVED and the row was re-dispatched" || bad "unblocker verdict missing"
-for i in $(seq 1 120); do [[ -f "$INST/state/a4.retiered" ]] && break; sleep 1; done
-[[ -f "$INST/state/a4.retiered" ]] \
-  && ok "max-unblock exhaustion retiered the row instead of paging" || bad "no retier after max unblock attempts"
-for i in $(seq 1 60); do grep -q "a4 returned BLOCKED" "$INST/state/events_A.log" && break; sleep 1; done
-for i in $(seq 1 60); do grep -q "HALTED" "$INST/state/lane_A.info" && break; sleep 1; done
-grep -q "HALTED" "$INST/state/lane_A.info" \
-  && ok "a retiered row that blocks again HALTS the lane (no infinite unblock loop)" \
-  || bad "the lane did not halt after the retiered row blocked again"
-
-note "8b. a halted lane's banner says its watcher is gone"
-# The banner used to be a single line nobody reads back, so a HALTED written at
-# the halt stayed on disk looking current long after the halt was cleared.
-for i in $(seq 1 30); do grep -q "watcher DOWN" "$INST/state/lane_A.info" && break; sleep 1; done
-grep -q "watcher DOWN" "$INST/state/lane_A.info" \
-  && ok "lane_A.info is freeze-marked when the watcher exits" \
-  || bad "lane_A.info still reads as live after the watcher exited: $(cat "$INST/state/lane_A.info")"
-"$ORCH" status | grep -q "no watcher" \
-  && ok "orch status flags a halted lane with no watcher behind it" \
-  || bad "orch status did not mention the missing watcher"
-kill "$DECOY" 2>/dev/null; DECOY=""
-
-note "9. state_resolver: OUR live process beats a stale sentinel; a stranger's does not"
-row_state(){ python3 "$HOME_DIR/lib/state_resolver.py" --json | python3 -c \
-  "import json,sys; d=json.load(sys.stdin); print([r['state'] for l in d['lanes'] for r in l['rows'] if r['id']=='$1'][0])"; }
-printf 'BLOCKED\nstale sentinel left over from an earlier halt\n' > "$INST/state/b2.status"
-tmux new-window -d -t "$SESSION" -n b2 "sleep 120" 2>/dev/null
-sleep 1
-# Bearing the row's NAME proves nothing — a finished session left open after
-# `orch reset` bears it too, and adopting one is how a lane reported RUNNING
-# for hours with nothing running.
-ST=$(row_state b2)
-[[ $ST == ORPHAN ]] && ok "an unstamped live window is an ORPHAN, not RUNNING (got ORPHAN)" \
-  || bad "an unstamped window was read as work (got $ST)"
-"$ORCH" status | grep -q "orch adopt b2" \
-  && ok "the orphan banner names the recovery" || bad "orphan banner did not name 'orch adopt'"
-# Claiming it is deliberate and explicit; only then does live beat the sentinel.
-"$ORCH" adopt b2 >/dev/null 2>&1
-ST=$(row_state b2)
-[[ $ST == RUNNING ]] && ok "an adopted live window overrides a stale BLOCKED sentinel (got RUNNING)" \
-  || bad "stale sentinel won over the adopted live process (got $ST)"
-tmux kill-window -t "$SESSION:b2" 2>/dev/null
-sleep 1
-ST=$(row_state b2)
-[[ $ST == BLOCKED ]] && ok "with the window gone the sentinel is authoritative again" \
-  || bad "expected BLOCKED once the window died, got $ST"
-# A spent unblocker sentinel from an earlier attempt series must not survive
-# the reset: the next ub-b2-1 would read it back as a fresh verdict.
-printf 'RESOLVED\nan earlier series\n' > "$INST/state/ub-b2-1.status"
-"$ORCH" reset b2 >/dev/null 2>&1
-[[ ! -e "$INST/state/ub-b2-1.status" ]] && ls "$INST/state"/ub-b2-1.status.consumed-* >/dev/null 2>&1 \
-  && ok "reset retires the row's spent ub-<id>-*.status (moved aside, not deleted)" \
-  || bad "reset left a stale unblocker sentinel behind"
-[[ -f "$INST/state/b2.window" ]] \
-  && bad "reset kept the window stamp — the old session would still count as work" \
-  || ok "reset drops the window stamp with the sentinel"
-
-note "9b. a CLOSED sentinel is terminal even over a matching live window"
-# A finished session left open (e.g. a Claude TUI that never /exit'd after
-# writing its sentinel) is a zombie, not proof of work. The lane has moved on,
-# so every read-only surface must read the row CLOSED, not RUNNING.
-tmux new-window -d -t "$SESSION" -n b2 "sleep 300" 2>/dev/null
-"$ORCH" adopt b2 >/dev/null 2>&1           # a matching window this rig claims
-printf 'CLOSED\nfinished\n' > "$INST/state/b2.status"
-sleep 1
-ST=$(row_state b2)
-[[ $ST == CLOSED ]] && ok "a CLOSED sentinel wins over a residual live window (got CLOSED)" \
-  || bad "a closed row read as $ST behind its leftover window"
-tmux kill-window -t "$SESSION:b2" 2>/dev/null
-"$ORCH" reset b2 >/dev/null 2>&1
-
-note "10. dead panes are never candidates"
-tmux new-window -d -t "$SESSION" -n deadrow "true" 2>/dev/null
-sleep 2
-python3 "$HOME_DIR/lib/state_resolver.py" --json | grep -q '"deadrow"' \
-  && bad "a dead pane appeared in live_windows" || ok "dead panes are filtered out of live windows"
-
-note "11. runtime retiering"
-"$ORCH" assign a4 gemini >/dev/null 2>&1
-grep -qx gemini "$INST/control/EXECUTOR_a4" && ok "assign wrote the executor override" || bad "assign did not write the override"
-"$ORCH" assignments all | grep -q "^a1 " && ok "assignments lists closed rows with 'all'" || bad "assignments all missing rows"
-"$ORCH" assign a1 mock 2>&1 | grep -q "REFUSED" && ok "assign refuses a CLOSED row" || bad "assign allowed retiering a CLOSED row"
-
-note "11b. the two Hermes tiers launch with their own model pins"
-hq=$(ORCH_INSTANCE="$INST" ORCH_BIN_HERMES=echo ORCH_MODEL_HERMES=qwen3.8-27b ORCH_MODEL_HERMES_PROVIDER=scaleway \
-     bash "$HOME_DIR/lib/adapters/hermes.sh" zz hermes /dev/null)
-[[ $hq == "-m qwen3.8-27b --provider scaleway" ]] && ok "hermes launches its pinned model and provider" \
-  || bad "hermes argv was '$hq'"
-hf=$(ORCH_INSTANCE="$INST" ORCH_BIN_HERMES=echo bash "$HOME_DIR/lib/adapters/hermesflash.sh" zz hermesflash /dev/null)
-[[ $hf == "-m deepseek-v4-flash-0731 --provider scaleway" ]] && ok "hermesflash launches the flash default with a named provider" \
-  || bad "hermesflash argv was '$hf'"
-hf=$(ORCH_INSTANCE="$INST" ORCH_BIN_HERMES=echo ORCH_MODEL_HERMESFLASH=m-x ORCH_MODEL_HERMESFLASH_PROVIDER=p-y \
-     bash "$HOME_DIR/lib/adapters/hermesflash.sh" zz hermesflash /dev/null)
-[[ $hf == "-m m-x --provider p-y" ]] && ok "hermesflash honours its orch.yaml pin" || bad "hermesflash pin argv was '$hf'"
-
 note "12. the dashboard renders read-only"
 if COLUMNS=200 python3 "$HOME_DIR/lib/dashboard_tui.py" --once >"$SBX/dash.out" 2>&1; then
   grep -q "sandbox" "$SBX/dash.out" && ok "dashboard renders a frame" || bad "dashboard frame missing the instance name"
@@ -435,33 +243,6 @@ else bad "bot test failed: $(tail -3 "$SBX/bot.out")"; fi
 python3 "$HOME_DIR/lib/telegram_bot.py" push --title t --body b >/dev/null 2>&1 \
   && ok "push is silent and harmless when unconfigured" || bad "push errored when unconfigured"
 
-note "14. the watcher waits out an orphan window instead of adopting it"
-# The reported failure, end to end: a row is reset while the finished session's
-# window is still open. The watcher used to adopt that window and report RUNNING
-# forever, and killing it halted the lane. It must now WAIT, keep its hands off
-# a window it does not own, and dispatch by itself the moment the window is
-# closed — with no `orch start`.
-mkdir -p "$SBX/project/cycle/PHASE_B/b3"
-echo "# plan for b3" > "$SBX/project/cycle/PHASE_B/b3/PLAN.md"
-printf '%s\t%s\t%s\t%s\t%s\n' b3 - 0 mock PHASE_B/b3/PLAN.md >> "$INST/queue_B.tsv"
-tmux new-window -d -t "$SESSION" -n b3 "sleep 300" 2>/dev/null    # the leftover session
-"$ORCH" start B >/dev/null 2>&1
-for i in $(seq 1 40); do grep -q "ORPHAN WINDOW" "$INST/state/lane_B.info" && break; sleep 1; done
-grep -q "ORPHAN WINDOW 'b3'" "$INST/state/lane_B.info" \
-  && ok "the watcher refuses to adopt an unstamped window and says so" \
-  || bad "the lane banner did not report the orphan: $(head -1 "$INST/state/lane_B.info")"
-[[ -f "$INST/state/b3.status" ]] \
-  && bad "the orphan row wrote a sentinel — it should not have run" \
-  || ok "the orphan row did not run behind a window that was not working it"
-tmux list-windows -t "$SESSION" -F '#{window_name}' | grep -qx b3 \
-  && ok "the leftover session was never yanked" || bad "the watcher killed a window it did not own"
-# Closing the window is the WHOLE recovery — no restart, no reset.
-tmux kill-window -t "$SESSION:b3" 2>/dev/null
-for i in $(seq 1 40); do [[ -f "$INST/state/b3.status" ]] && break; sleep 1; done
-[[ $(have b3) == CLOSED ]] \
-  && ok "closing the orphan let the lane dispatch and close b3 with no 'orch start'" \
-  || bad "the lane did not resume after the orphan was closed (b3=$(have b3))"
-
 note "15. every generated charter carries the never-open clause"
 # A preset instance renders its own work orders; the clause must reach every
 # flavour a session can be dispatched with, and the unblocker's.
@@ -475,14 +256,14 @@ for x in opus gemini codex; do
 done
 ORCH_INSTANCE="$PI" python3 "$HOME_DIR/lib/template_engine.py" unblock --id p1 --lane A --n 1 --exec gemini \
   --plan PHASE_P/p1/PLAN.md --reason test >/dev/null 2>&1
-for f in p1.lead.md p1.scoped.md p1.codex.md ub-p1-1.scoped.md; do
+for f in p1.hard.md p1.jrdev.md p1.codex.md $(cd "$PI/prompts" && ls ub-p1-1.*.md); do
   grep -q "NEVER-OPEN (binding, verbatim)" "$PI/prompts/$f" 2>/dev/null \
     && grep -q -- "--exclude='\*.local\*'" "$PI/prompts/$f" \
     && ok "work order $f carries the verbatim never-open clause" \
     || bad "work order $f lacks the never-open clause"
 done
-ORCH_INSTANCE="$PI" "$ORCH" prompt p1 2>/dev/null | grep -q "p1.lead.md" \
-  && grep -q "NEVER-OPEN (binding, verbatim)" "$PI/prompts/p1.lead.md" \
+ORCH_INSTANCE="$PI" "$ORCH" prompt p1 2>/dev/null | grep -q "p1.hard.md" \
+  && grep -q "NEVER-OPEN (binding, verbatim)" "$PI/prompts/p1.hard.md" \
   && ok "orch prompt regenerates an opus row's work order with the clause" \
   || bad "orch prompt did not produce the clause"
 
@@ -496,7 +277,7 @@ printf 'STOP never read\n' > "$D1/artifacts/notes.local.txt"       # the never-o
 printf 'PASS  orch done refused a CLOSED over a HEADS_UNCHANGED no line\n' > "$D1/artifacts/test_log.out"  # a quotation, not a verdict
 printf '# PROGRESS d1\nThe PLAN says STOP if the heads move; that is prose, not a stop line.\n' > "$D1/PROGRESS.md"
 "$ORCH" done d1 "closing over a moved head" > "$SBX/cc1.out" 2>&1
-[[ -z "$(have d1)" ]] && grep -q "stop_lines=1 " "$SBX/cc1.out" && grep -q "^REFUSED" "$SBX/cc1.out" \
+[[ -z "$(have d1)" ]] && grep -q "1 stop line(s)" "$SBX/cc1.out" && grep -q "^REFUSED" "$SBX/cc1.out" \
   && ok "orch done refused a CLOSED over a HEADS_UNCHANGED no line (falsifier, *.local*, prose and quotations not counted)" \
   || bad "orch done did not refuse the close: $(head -3 "$SBX/cc1.out")"
 printf '\n### DEC-9 — PROPOSED (d1)\nnot a signature\n' >> "$SBX/project/cycle/DECISIONS.md"
@@ -504,10 +285,10 @@ echo 'SIGNED_RULING DEC-9' >> "$D1/PROGRESS.md"
 "$ORCH" done d1 "closing on a proposal" > "$SBX/cc2.out" 2>&1
 [[ -z "$(have d1)" ]] && grep -q "none is a signed" "$SBX/cc2.out" \
   && ok "a PROPOSED entry is not a signed ruling (still refused)" || bad "a PROPOSED entry let the close through"
-printf '\n### DEC-8 — RATIFIED (the operator)\nthe moved head is accepted for d1\n' >> "$SBX/project/cycle/DECISIONS.md"
+printf '\n### DEC-8 — RATIFIED (the Owner)\nthe moved head is accepted for d1\n' >> "$SBX/project/cycle/DECISIONS.md"
 echo 'SIGNED_RULING DEC-8' >> "$D1/PROGRESS.md"
 "$ORCH" done d1 "closed on a signed ruling" > "$SBX/cc3.out" 2>&1
-[[ $(have d1) == CLOSED ]] && grep -q "signed=DEC-8" "$SBX/cc3.out" \
+[[ $(have d1) == CLOSED ]] && grep -q "signed ruling DEC-8" "$SBX/cc3.out" \
   && ok "a signed (RATIFIED) ruling named in PROGRESS lets the close through" \
   || bad "the signed ruling did not let the close through: $(head -3 "$SBX/cc3.out")"
 "$ORCH" closecheck d1 >/dev/null 2>&1 && ok "orch closecheck exposes the same check (exit 0 once signed)" \
@@ -549,7 +330,7 @@ python3 - "$INST/orch.yaml" <<'PY'
 import sys, pathlib, re
 f = pathlib.Path(sys.argv[1]); t = f.read_text()
 t = re.sub(r'allowed: \[([^\]]*)\]', lambda m: f'allowed: [{m.group(1)}, opencode]', t, count=1)
-t = t.replace('paste_kick: []', 'paste_kick: []\n  arg_kick: [opencode]')
+t = t.replace('  dead_window_policy: "retier"', '  dead_window_policy: "retier"\n  arg_kick: [opencode]')
 f.write_text(t)
 PY
 mkdir -p "$SBX/project/cycle/PHASE_O/o1"; echo "# plan for o1" > "$SBX/project/cycle/PHASE_O/o1/PLAN.md"
@@ -557,27 +338,29 @@ printf '%s\t%s\t%s\t%s\t%s\n' o1 - 0 opencode PHASE_O/o1/PLAN.md > "$INST/queue_
 "$ORCH" lint > "$SBX/lint_o.out" 2>&1 && ok "lint accepts an opencode row (adapter + kick resolve)" \
   || bad "lint refused the opencode row: $(tail -3 "$SBX/lint_o.out")"
 "$ORCH" prompt o1 >/dev/null 2>&1
-[[ -s $INST/prompts/o1.scoped.md ]] && grep -q "scoped tier" "$INST/prompts/o1.kick.txt" 2>/dev/null \
-  && ok "an arg_kick executor gets its kick written (flavor fallback _KICK_SCOPED.txt)" \
+[[ -s $INST/prompts/o1.jrdev.md ]] && grep -q "fresh executor" "$INST/prompts/o1.kick.txt" 2>/dev/null \
+  && ok "an arg_kick executor gets its kick written (flavor fallback _KICK_JRDEV.txt)" \
   || bad "no kick written for the arg_kick executor"
 echo "OPENCODE KICK __ID__ -> __WORKORDER__" > "$INST/prompts/_KICK_OPENCODE.txt"
 "$ORCH" prompt o1 >/dev/null 2>&1
-grep -qx "OPENCODE KICK o1 -> .*prompts/o1.scoped.md" "$INST/prompts/o1.kick.txt" \
+grep -qx "OPENCODE KICK o1 -> .*prompts/o1.jrdev.md" "$INST/prompts/o1.kick.txt" \
   && ok "the executor's own _KICK_OPENCODE.txt wins over the flavor's kick, and is rewritten" \
   || bad "the executor-specific kick was not used: $(head -1 "$INST/prompts/o1.kick.txt")"
 STUB="$SBX/opencode-stub"; printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "%s"\n' "$SBX/oc_argv" > "$STUB"; chmod +x "$STUB"
-( cd "$SBX/project/cycle" && ORCH_BIN_OPENCODE="$STUB" ORCH_ARG_KICK=opencode ORCH_MODEL_OPENCODE=m-1 \
-    ORCH_MODEL_OPENCODE_PROVIDER=prov "$HOME_DIR/lib/adapters/opencode.sh" o1 opencode "$INST/prompts/o1.scoped.md" )
-[[ $(sed -n 1,3p "$SBX/oc_argv" | tr '\n' ' ') == "-m prov/m-1 --auto " ]] && [[ $(sed -n 4p "$SBX/oc_argv") == --prompt ]] \
-  && grep -q "^OPENCODE KICK o1" "$SBX/oc_argv" \
-  && ok "the adapter launches -m provider/model --auto --prompt <kick>" || bad "adapter argv: $(tr '\n' ' ' < "$SBX/oc_argv")"
 echo "other/m-2" > "$INST/control/OPENCODE_MODEL_o1"
-( cd "$SBX/project/cycle" && ORCH_BIN_OPENCODE="$STUB" ORCH_ARG_KICK="" ORCH_MODEL_OPENCODE=m-1 \
-    ORCH_MODEL_OPENCODE_PROVIDER=prov "$HOME_DIR/lib/adapters/opencode.sh" o1 opencode "$INST/prompts/o1.scoped.md" )
-[[ $(sed -n 2p "$SBX/oc_argv") == other/m-2 ]] && grep -q "scoped tier" "$SBX/oc_argv" && ! grep -q "OPENCODE KICK" "$SBX/oc_argv" \
-  && ok "a per-row model override wins; outside arg_kick the full work order is the prompt" \
-  || bad "override/work-order argv: $(tr '\n' ' ' < "$SBX/oc_argv" | cut -c1-200)"
+( cd "$SBX/project/cycle" && ORCH_BIN_OPENCODE="$STUB" ORCH_ARG_KICK=opencode ORCH_MODEL_OPENCODE=m-1 \
+    ORCH_MODEL_OPENCODE_PROVIDER=prov "$HOME_DIR/lib/adapters/opencode.sh" o1 opencode "$INST/prompts/o1.jrdev.md" )
+[[ $(sed -n 1,2p "$SBX/oc_argv" | tr '\n' ' ') == "--auto --prompt " ]] && ! grep -qx -- "-m" "$SBX/oc_argv" \
+  && grep -q "^OPENCODE KICK o1" "$SBX/oc_argv" \
+  && ok "the adapter launches --auto --prompt <kick> and never picks a model (pins and overrides ignored)" \
+  || bad "adapter argv: $(tr '\n' ' ' < "$SBX/oc_argv")"
+( cd "$SBX/project/cycle" && ORCH_BIN_OPENCODE="$STUB" ORCH_ARG_KICK="" \
+    "$HOME_DIR/lib/adapters/opencode.sh" o1 opencode "$INST/prompts/o1.jrdev.md" )
+grep -q "JUNIOR tier" "$SBX/oc_argv" && ! grep -q "OPENCODE KICK" "$SBX/oc_argv" \
+  && ok "outside arg_kick the full work order is the prompt" \
+  || bad "work-order argv: $(tr '\n' ' ' < "$SBX/oc_argv" | cut -c1-200)"
 rm -f "$INST/control/OPENCODE_MODEL_o1"
+echo "# PROGRESS o1" > "$SBX/project/cycle/PHASE_O/o1/PROGRESS.md"
 "$ORCH" done o1 "opencode row closed by the CLI" > "$SBX/o1done.out" 2>&1
 [[ $(have o1) == CLOSED ]] && ok "orch done closes an opencode row (it does not write its own sentinel)" \
   || bad "orch done refused the opencode row: $(head -2 "$SBX/o1done.out")"

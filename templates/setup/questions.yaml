@@ -1,0 +1,185 @@
+# Setup questions — the behaviour switches a setup agent asks the Owner about.
+#
+# `orch setup questions [--json]` prints them (with the preset's recommendations);
+# `orch setup apply --answer <id>=<option>[,<option>…]` writes the chosen settings
+# into orch.yaml and records the answer in <instance>/setup.answers.yaml.
+#
+# Schema
+#   id          stable answer key
+#   header      ≤ 12 chars (a question-tool chip)
+#   question    the question, ending in "?"
+#   why         one line: what it changes in practice
+#   options     single choice: each {id, label, description, set: {dotted.key: value}}
+#   multi       true = several options may be chosen; then `key` names the list they
+#               fill and `always` is appended (options carry `value` instead of `set`)
+#   recommended the option id(s) recommended when no preset overrides it
+#
+# Values in `set` may use "@agents": the chosen executors.allowed minus manual/mock.
+
+- id: executors
+  header: Executors
+  question: Which agent CLIs may run rows on this rig?
+  why: Only listed executors can be assigned; each needs its CLI installed and logged in.
+  multi: true
+  key: executors.allowed
+  always: [manual, mock]
+  options:
+    - {id: opus, value: opus, label: Opus, description: "Claude Opus — high-decision rows, judges, unblockers"}
+    - {id: sonnet, value: sonnet, label: Sonnet, description: "Claude Sonnet — most judgment rows"}
+    - {id: opencode, value: opencode, label: OpenCode, description: "OpenCode CLI — mechanical junior rows"}
+    - {id: gemini, value: gemini, label: Gemini, description: "Gemini CLI — mechanical junior rows, falsifiers"}
+    - {id: codex, value: codex, label: Codex, description: "Codex CLI — well-specified mechanical changes"}
+    - {id: haiku, value: haiku, label: Haiku, description: "Claude Haiku — mechanical junior rows; never a decision role"}
+  recommended: [opus, sonnet, opencode, gemini]
+
+- id: unblocker
+  header: Unblocker
+  question: Who should unblock a row that stops with BLOCKED, unattended?
+  why: The unblocker fixes the plan (never the work) and re-runs the row; after the attempts run out the row is retiered once, then halts and pages.
+  options:
+    - id: opus
+      label: Opus, 2 attempts
+      description: Strongest judgment on stuck rows; costs Opus quota.
+      set: {executors.unblock_executor: opus, executors.unblock_executors: [], executors.max_unblock_attempts: 2, executors.retier_on_max_unblock: opus}
+    - id: sonnet-then-opus
+      label: Sonnet, then Opus
+      description: First attempt on Sonnet, second on Opus; a Sonnet ESCALATE goes to Opus before it pages you.
+      set: {executors.unblock_executor: sonnet, executors.unblock_executors: [sonnet, opus], executors.unblock_ladder: true, executors.max_unblock_attempts: 2, executors.retier_on_max_unblock: opus}
+    - id: sonnet
+      label: Sonnet, 2 attempts
+      description: Cheaper; escalates more often.
+      set: {executors.unblock_executor: sonnet, executors.unblock_executors: [], executors.max_unblock_attempts: 2, executors.retier_on_max_unblock: opus}
+  recommended: opus
+
+- id: unblock_scope
+  header: Unblock who
+  question: Which rows get an automatic unblocker when they block?
+  why: Rows outside the list halt and page instead. ROUTE_A always halts.
+  options:
+    - {id: all, label: Every agent row, description: "All executors (overnight runs keep moving)", set: {executors.auto_unblock: "@agents"}}
+    - {id: junior, label: Junior rows only, description: "Haiku/OpenCode/Gemini/Codex rows; an Opus or Sonnet block halts and pages", set: {executors.auto_unblock: []}}
+  recommended: all
+
+- id: review
+  header: Review
+  question: Should an independent reviewer on another model re-verify each closed row before dependents start?
+  why: Every reviewed row costs one extra session. Plans that already pair each build with a falsifier row on another model do not need it.
+  options:
+    - {id: none, label: No per-row review, description: "Close checks only; plans carry their own falsifier rows", set: {review.policy: none}}
+    - {id: junior, label: Junior rows only, description: "Review Haiku/OpenCode/Gemini/Codex rows", set: {review.policy: junior}}
+    - {id: all, label: Every row, description: "Strongest guarantee; doubles sessions", set: {review.policy: all}}
+  recommended: none
+
+- id: scheduler
+  header: Scheduling
+  question: How should rows be scheduled?
+  why: dag runs any row whose declared deps are done (more parallel work); serial also waits for the row above it in its lane.
+  options:
+    - {id: dag, label: By dependencies, description: "dag — uses the machine; plans must declare every dep", set: {scheduler.mode: dag}}
+    - {id: serial, label: Lane order, description: "serial — v1 behaviour; safer for plans written without full deps", set: {scheduler.mode: serial}}
+  recommended: dag
+
+- id: capacity
+  header: Capacity
+  question: How many agent sessions may run at once?
+  why: A Claude/OpenCode session takes about 0.2–0.5 GB; RAM admission also holds back dispatch below the free-memory floor.
+  options:
+    - {id: small, label: "4 sessions", description: "≤ 8 GB RAM or a tight model quota (floor 2 GB free)", set: {scheduler.max_parallel: 4, scheduler.min_free_mb: 2048}}
+    - {id: medium, label: "8 sessions", description: "16 GB RAM (floor 3 GB free)", set: {scheduler.max_parallel: 8, scheduler.min_free_mb: 3072}}
+    - {id: large, label: "12 sessions", description: "32 GB RAM or more (floor 4 GB free)", set: {scheduler.max_parallel: 12, scheduler.min_free_mb: 4096}}
+  recommended: auto   # chosen from MemTotal at question time
+
+- id: effort
+  header: Effort
+  question: Should Claude sessions run at high reasoning effort?
+  why: Passes --effort high to every Opus/Sonnet launch (rows, unblockers, reviewers).
+  options:
+    - {id: high, label: High effort, description: "Better on judgment rows; slower, more quota", set: {executors.args: {opus: ["--effort", "high"], sonnet: ["--effort", "high"]}}}
+    - {id: default, label: CLI default, description: "Whatever the user's Claude settings say", set: {executors.args: {}}}
+  recommended: high
+
+- id: notify
+  header: Phone
+  question: Which engine events should reach your phone (Telegram)?
+  why: Rows can always page explicitly with `orch notify`. Needs watchdog.telegram_chat_id and the bot token in watchdog.env_file.
+  options:
+    - {id: critical, label: Critical only, description: "Halts, Route A, forged verdicts, no progress", set: {watchdog.enabled: true, watchdog.push_min_urgency: critical}}
+    - {id: normal, label: Normal + critical, description: "Also usage limits, rejects, retiers, lanes complete", set: {watchdog.enabled: true, watchdog.push_min_urgency: normal}}
+    - {id: off, label: None, description: "Watch with orch status / dashboard only", set: {watchdog.enabled: false}}
+  recommended: critical
+
+- id: idle
+  header: Idle rows
+  question: What should happen to a session that goes quiet without claiming its row?
+  why: Junior CLIs sometimes stop to ask a question nobody will answer.
+  options:
+    - {id: nudge, label: "Nudge ×2 at 20 min", description: "Type a reminder twice, then leave it", set: {idle.nudge_after: 1200, idle.max_nudges: 2, idle.block_after: 0}}
+    - {id: nudge-block, label: "Nudge ×2, then block", description: "After the 2nd nudge and 30 min more, mark BLOCKED so an unblocker takes it", set: {idle.nudge_after: 1200, idle.max_nudges: 2, idle.block_after: 1800}}
+    - {id: off, label: Never, description: "Leave quiet sessions alone", set: {idle.nudge_after: 0}}
+  recommended: nudge-block
+
+- id: dead_window
+  header: Dead window
+  question: What should happen when a row's window dies without a claim?
+  why: Crashes and OOM kills leave no sentinel.
+  options:
+    - {id: retier, label: Re-run once on the retier tier, description: "Unattended runs keep moving", set: {executors.dead_window_policy: retier}}
+    - {id: halt, label: Halt and page, description: "You look at every crash", set: {executors.dead_window_policy: halt}}
+  recommended: retier
+
+- id: plan_review
+  header: Plan review
+  question: Must a round's plans pass an Opus plan review before the round can start?
+  why: "orch preflight --review dispatches the review; with this on, round start waits for its PASS."
+  options:
+    - {id: optional, label: Optional, description: "Run it when a round is risky", set: {preflight.required: false}}
+    - {id: required, label: Required, description: "Every round waits for a PASS", set: {preflight.required: true}}
+  recommended: optional
+
+- id: autonomy
+  header: Autonomy
+  question: Who handles what would otherwise page you or leave the rig idle?
+  why: "With the Steward lane on, halts, held gates, a resting rig and round transitions go to a Steward session that acts through engine-checked `orch sw` requests, each logged with its revert in steward/STEWARD_LOG.md; only page classes you allow reach the phone. Needs steward/RIGHTS.md (the decision-rights table)."
+  options:
+    - {id: steward, label: Steward lane, description: "Sonnet for mechanical incidents, Opus for judgment; walls go to your inbox, never a page", set: {steward.enabled: true, steward.tiers: {mechanical: sonnet, judgment: opus}, guard.queue_watch: true}}
+    - {id: off, label: Off, description: "v2 behaviour: every halt pages you and waits for orch reset", set: {steward.enabled: false, guard.queue_watch: false}}
+  recommended: steward
+
+- id: cadence
+  header: Cadence
+  question: Should your inbox answers wake the Steward at once, and should a rig with nothing running page you?
+  why: "Wake on answer: an inbox item you close (`orch steward inbox done <k> [LETTER]`) opens one `answered` incident within 2 min, so the next step does not wait for a clock. Idle page: no session of any kind live for 45 min sends one short page — `stall` (an inbox item waits on you) or `idle` (the Steward set nothing up) — again at 3 h, at most 4 a day. Needs the Steward lane; add `stall, idle` to steward.page_classes for the phone."
+  options:
+    - {id: both, label: Wake + idle page, description: "Answers wake the Steward in minutes; 45 min of nothing running pages you", set: {steward.wake_on_answer: true, steward.answer_debounce: 120, steward.idle_page_after: 2700, steward.idle_repage: [10800], steward.idle_pages_per_day: 4}}
+    - {id: wake, label: Wake only, description: "Answers wake the Steward; an idle rig is a digest line", set: {steward.wake_on_answer: true, steward.idle_page_after: 0}}
+    - {id: off, label: Off, description: "The rig's own clocks and duties decide when the Steward acts", set: {steward.wake_on_answer: false, steward.idle_page_after: 0}}
+  recommended: both
+
+- id: digest
+  header: Digest
+  question: When do you want the rig's digest (what happened, Steward acts with their undo, your inbox, spend)?
+  why: An ordinary Telegram message plus digest/<date>.md — never a page.
+  options:
+    - {id: morning, label: "08:00", description: "Once a day", set: {digest.times: ["08:00"]}}
+    - {id: twice, label: "08:00 + 18:00", description: "Morning and evening", set: {digest.times: ["08:00", "18:00"]}}
+    - {id: off, label: None, description: "orch digest by hand", set: {digest.times: []}}
+  recommended: twice
+
+- id: spend
+  header: Spend
+  question: Should paid commands run through the spend governor (Owner-approved caps; over a cap the row waits and you get one page)?
+  why: "Rows run paid commands as `orch spend run --provider P --est USD -- <cmd>`. The engine reads only the caps you approved (`orch spend caps approve` copies <instance>/SPEND_CAPS.yaml); until then every cap is closed. Over a cap nothing runs, the row waits in spend_wait, and you get ONE page you answer `spend <id> A` (raise by the shortfall) or `B` (hold)."
+  options:
+    - {id: metered, label: Governor + OpenCode meter, description: "As governor, and what OpenCode spends is read from its own db (cost/tokens only): over a cap the OpenCode tier is held and you get one page", set: {spend.enabled: true, spend.opencode.meter: true}}
+    - {id: governor, label: Governor on, description: "Caps from SPEND_CAPS.yaml once approved; money is the only page", set: {spend.enabled: true}}
+    - {id: off, label: Off, description: "orch spend run just runs and books the cost (no caps, no page)", set: {spend.enabled: false}}
+  recommended: off
+
+- id: always_on
+  header: Always on
+  question: Should the engine survive reboots and crashes by itself (systemd user units + a dead-man timer)?
+  why: "Run `orch service install` once; `loginctl enable-linger $USER` lets the units start at boot without a login."
+  options:
+    - {id: service, label: "Yes (orch service install)", description: "Engine and bot as user units; stale heartbeat -> restart; 2 failed restarts -> one page", set: {engine.self_update: true, engine.commit_bookkeeping: true}}
+    - {id: tmux, label: "No, tmux only", description: "v2 behaviour: a reboot leaves the engine down until orch start", set: {engine.commit_bookkeeping: false}}
+  recommended: service

@@ -1,0 +1,1 @@
+UNATTENDED reminder from the orchestration engine: nobody answers in this window. Write your findings file, then record your verdict with: __VERDICTCMD__ (CONFIRM or OBJECT — OBJECT when you could not check the proposal). Then make no further tool calls.

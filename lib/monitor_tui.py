@@ -33,13 +33,13 @@ except ImportError:                             # pragma: no cover
     raise SystemExit(2)
 
 LIVE_STATES = {"RUNNING", "UNBLOCKING", "QUIET", "ORPHAN"}
-HALT_STATES = {"BLOCKED", "ESCALATED", "HALTED"}
+HALT_STATES = {"BLOCKED", "ROUTE_A", "HALTED"}
 STATE_STYLE = {
     "READY": "bold green", "RUNNING": "bold cyan", "UNBLOCKING": "bold magenta",
     "QUIET": "bold yellow", "ORPHAN": "bold red", "APPROVAL": "bold yellow",
     "MANUAL": "bold blue", "WAITING": "yellow", "AFTER": "cyan",
     "PAUSED": "dim yellow", "STOPPED": "bold red", "BLOCKED": "bold red",
-    "ESCALATED": "bold red", "HALTED": "bold red", "CLOSED": "dim green",
+    "ROUTE_A": "bold red", "HALTED": "bold red", "CLOSED": "dim green",
 }
 
 
@@ -101,7 +101,7 @@ def next_candidates(lanes: List[Dict[str, Any]], snap: Dict[str, Any],
     running_ids = {row["id"] for _, row in running_rows(lanes)}
     priority = {
         "READY": 0, "APPROVAL": 1, "MANUAL": 1, "AFTER": 2,
-        "WAITING": 3, "BLOCKED": 4, "ESCALATED": 4, "HALTED": 4,
+        "WAITING": 3, "BLOCKED": 4, "ROUTE_A": 4, "HALTED": 4,
         "PAUSED": 5, "STOPPED": 5,
     }
     out = []
@@ -113,14 +113,6 @@ def next_candidates(lanes: List[Dict[str, Any]], snap: Dict[str, Any],
         out.append((priority.get(status, 9), lane_index, lv, row, status, reason))
     out.sort(key=lambda item: (item[0], item[1]))
     return [(lv, row, status, reason) for _, _, lv, row, status, reason in out[:limit]]
-
-
-def friendly_work(row: Dict[str, Any]) -> str:
-    name = Path(row.get("plan") or "").parent.name
-    prefix = row["id"] + "_"
-    if name.startswith(prefix):
-        name = name[len(prefix):]
-    return name.replace("_", " ") or "—"
 
 
 def actionable_items(lanes: List[Dict[str, Any]], snap: Dict[str, Any]) -> Tuple[List[Tuple[str, str, str]], int]:
@@ -277,14 +269,12 @@ def next_panel(candidates: List[Tuple[Dict[str, Any], Dict[str, Any], str, str]]
     table.add_column("lane", width=5)
     table.add_column("row", width=13, style="bold", no_wrap=True, overflow="ellipsis")
     table.add_column("status", width=11, no_wrap=True)
+    table.add_column("executor", width=10, no_wrap=True, overflow="ellipsis")
     table.add_column("reason", ratio=1, no_wrap=True, overflow="ellipsis")
-    if width >= 100:
-        table.add_column("work", ratio=1, no_wrap=True, overflow="ellipsis")
     for i, (lv, row, status, reason) in enumerate(candidates, 1):
         values: List[Any] = [str(i), lv["lane"], row["id"],
-                             Text(status, style=STATE_STYLE.get(status, "white")), reason]
-        if width >= 100:
-            values.append(friendly_work(row))
+                             Text(status, style=STATE_STYLE.get(status, "white")),
+                             row.get("executor") or "—", reason]
         table.add_row(*values)
     return Panel(table, title=f"NEXT {len(candidates)} ACROSS THE RIG",
                  box=box.ROUNDED, border_style="blue")

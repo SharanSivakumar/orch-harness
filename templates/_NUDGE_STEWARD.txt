@@ -1,0 +1,1 @@
+UNATTENDED reminder from the orchestration engine: nobody answers in this window. Act through `./orch sw …`, write your analysis file, then record your verdict with: __VERDICTCMD__ (RESOLVED, PARKED, INBOX or ESCALATE). Then make no further tool calls.

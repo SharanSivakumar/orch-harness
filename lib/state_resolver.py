@@ -5,7 +5,7 @@ An earlier rig had three independent readers of the same state — the bash
 `status` subcommand, dashboard.py, and the Telegram poller — and they
 disagreed. Two failure modes were routine:
 
-  1. STALE SENTINEL. A row halted, the operator intervened by hand and re-dispatched
+  1. STALE SENTINEL. A row halted, the Owner intervened by hand and re-dispatched
      it; state/<id>.status still said BLOCKED, so the banner read HALTED while
      the agent was visibly working. Rule here: a LIVE tmux window for <id>
      outranks any sentinel on disk. Live process > stale sentinel.
@@ -40,28 +40,17 @@ from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config_parser import Config, load  # noqa: E402
-
-ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+import tmuxio  # noqa: E402
+from rows import active_lanes, archived_lanes, find_row, implicit_deps, load_rows, parse_file, unmet_deps  # noqa: E402
+from store import Store  # noqa: E402
 
 TERMINAL = {"CLOSED"}
-HALTING = {"BLOCKED", "ESCALATED"}
+HALTING = {"BLOCKED", "ROUTE_A"}
 
 # Display precedence, worst first — used to pick a lane's headline state.
-SEVERITY = ["ESCALATED", "BLOCKED", "HALTED", "ORPHAN", "UNBLOCKING", "GATED",
-            "MANUAL", "QUIET", "RUNNING", "PAUSED", "WAITING", "PENDING", "CLOSED"]
-
-
-def _instance_of_pid(pid: str) -> Optional[str]:
-    """ORCH_INSTANCE from a process's environment; None when it cannot be read.
-    Only that one variable is extracted; nothing else is kept or printed."""
-    try:
-        raw = Path(f"/proc/{int(pid)}/environ").read_bytes()
-    except Exception:
-        return None
-    for item in raw.split(b"\0"):
-        if item.startswith(b"ORCH_INSTANCE="):
-            return item[len(b"ORCH_INSTANCE="):].decode(errors="replace")
-    return None
+SEVERITY = ["ROUTE_A", "BLOCKED", "HALTED", "ORPHAN", "UNBLOCKING", "REJECTED", "GATED", "SPEND_WAIT",
+            "MANUAL", "LIMITED", "QUIET", "RUNNING", "VERIFYING", "REVIEWING", "READY", "PAUSED",
+            "DISABLED", "WAITING", "PENDING", "CLOSED"]
 
 
 def _sh(cmd: List[str], timeout: int = 15) -> str:
@@ -81,87 +70,61 @@ class Row:
     queue_exec: str
     plan: str
     extra_allow: List[str] = field(default_factory=list)
+    meta: Dict[str, str] = field(default_factory=dict)
     sentinel: str = "NONE"
     note: str = ""
+    phase: str = ""
     executor: str = ""
     exec_source: str = "queue"
     state: str = "PENDING"
     live_window: bool = False
     window_ours: bool = False
     unblock_window: str = ""
+    review_window: str = ""
     unblock_n: int = 0
+    attempt: int = 0
     unmet_deps: List[str] = field(default_factory=list)
     idle_secs: int = -1
+    why: str = ""
 
 
 class Resolver:
-    def __init__(self, cfg: Optional[Config] = None):
+    def __init__(self, cfg: Optional[Config] = None, tmux: bool = True):
         self.cfg = cfg or load()
-        self.windows = self._tmux_windows()
+        self.st = Store(self.cfg.state)
+        self.windows = self._tmux_windows() if tmux else {}
 
     # -- tmux ------------------------------------------------------------
     def _tmux_windows(self) -> Dict[str, Dict[str, Any]]:
-        """name -> {alive, activity, index}. Dead panes are dropped entirely."""
-        out = _sh(["tmux", "list-windows", "-t", self.cfg.tmux_session, "-F",
-                   "#{window_name}\t#{pane_dead}\t#{window_activity}\t#{window_index}"
-                   "\t#{window_id}\t#{pane_pid}"])
-        wins: Dict[str, Dict[str, Any]] = {}
-        for line in out.splitlines():
-            parts = line.split("\t")
-            if len(parts) < 4:
-                continue
-            name, dead, act, idx = parts[0], parts[1], parts[2], parts[3]
-            if dead == "1":
-                continue          # anti-desync rule 2: corpses are never candidates
-            wins[name] = {"alive": True,
-                          "activity": int(act) if act.isdigit() else 0,
-                          "index": idx,
-                          "ident": " ".join(parts[4:6]) if len(parts) >= 6 else ""}
-        return wins
+        """name -> {alive, activity, ident}. Dead panes are dropped entirely."""
+        return {n: {"alive": True, "activity": w["activity"], "ident": w.ident}
+                for n, w in tmuxio.windows(self.cfg.tmux_session).items() if w["alive"]}
 
     def alive(self, name: str) -> bool:
         return name in self.windows
 
     def window_is_ours(self, rid: str) -> bool:
-        """True when the live window named <rid> is the session the rig dispatched.
-
-        Bearing a row's name is not evidence of work — a finished session left
-        open after `orch reset` bears it too. dispatch() writes the tmux
-        window_id + pane_pid it created to state/<id>.window; anything else is
-        an orphan. Both halves are compared because tmux reuses window ids
-        across a server restart.
-        """
         w = self.windows.get(rid)
         if not w:
             return False
-        try:
-            stamp = (self.cfg.state / f"{rid}.window").read_text().split("\n")[0]
+        d = self.st.dispatch(rid)
+        if d.get("ident"):
+            return w.get("ident") == d["ident"]
+        try:   # v1 stamp
+            parts = (self.cfg.state / f"{rid}.window").read_text().split()
         except Exception:
             return False
-        parts = stamp.split()
-        if len(parts) < 2:
-            return False
-        return w.get("ident") == " ".join(parts[:2])
+        return len(parts) >= 2 and w.get("ident") == " ".join(parts[:2])
 
     def capture(self, name: str, lines: int = 20) -> str:
         if not self.alive(name):
             return ""
-        raw = _sh(["tmux", "capture-pane", "-t", f"{self.cfg.tmux_session}:{name}",
-                   "-p", "-S", f"-{lines}"])
-        keep = [l.rstrip() for l in ANSI.sub("", raw).splitlines() if l.strip()]
-        return "\n".join(keep[-lines:])
+        return "\n".join(tmuxio.tail_lines(tmuxio.capture(self.cfg.tmux_session, name, lines + 20), lines))
 
     # -- disk ------------------------------------------------------------
     def sentinel(self, rid: str):
-        f = self.cfg.state / f"{rid}.status"
-        try:
-            txt = f.read_text(errors="replace").splitlines()
-        except Exception:
-            return "NONE", ""
-        if not txt or not txt[0].strip():
-            return "NONE", ""
-        verdict = re.sub(r"[^A-Z_]", "", txt[0].strip().upper()) or "NONE"
-        return verdict, (txt[1].strip() if len(txt) > 1 else "")
+        v, note, _ = self.st.status(rid)
+        return v, note
 
     def gate_open(self, rid: str) -> bool:
         return (self.cfg.control / f"GO_{rid}").exists()
@@ -169,7 +132,7 @@ class Resolver:
     def override(self, rid: str) -> str:
         f = self.cfg.control / f"EXECUTOR_{rid}"
         try:
-            return re.sub(r"[^a-z]", "", f.read_text().strip().lower())
+            return re.sub(r"[^a-z0-9_-]", "", f.read_text().strip().split()[0].lower())
         except Exception:
             return ""
 
@@ -181,74 +144,69 @@ class Resolver:
         c = self.cfg.control
         return (c / "STOP").exists() or (c / f"STOP_{lane}").exists()
 
+    def enabled(self, lane: str) -> bool:
+        c = self.cfg.control
+        return (c / f"RUN_{lane}").exists() or (c / "RUN_ALL").exists()
+
+    def engine_alive(self) -> bool:
+        if getattr(self, "_engine", None) is None:
+            hb = self.cfg.state / "engine.heartbeat"
+            try:
+                tick = float((self.cfg.data.get("scheduler") or {}).get("tick_seconds", 15))
+                self._engine = time.time() - hb.stat().st_mtime < max(90.0, tick * 4)
+            except Exception:
+                self._engine = False
+        return self._engine
+
     def watcher_running(self, lane: str) -> bool:
-        # Scoped to THIS instance: lane letters repeat across rigs, so a
-        # bare process-name match read another instance's watcher as ours. A
-        # candidate counts only when the ORCH_INSTANCE in its environment resolves
-        # to ours; an unreadable environment counts as ours (the conservative side,
-        # the same rule as orchestrator_core.sh watcher_pids).
-        pat = re.compile(rf"orchestrator_core\.sh run {re.escape(lane)}(\s|$)")
-        mine = str(self.cfg.instance.resolve())
-        for line in _sh(["ps", "-eo", "pid=,args="]).splitlines():
-            pid, _, args = line.strip().partition(" ")
-            if not pat.search(args):
-                continue
-            inst = _instance_of_pid(pid)
-            if inst is None or str(Path(inst).resolve()) == mine:
-                return True
-        return False
+        """v2: the lane is babysat when the rig's engine is up and the lane is enabled."""
+        return self.engine_alive() and self.enabled(lane)
 
     def leases(self) -> Dict[str, Dict[str, str]]:
         out: Dict[str, Dict[str, str]] = {}
-        if not self.cfg.leases.is_dir():
-            return out
-        for d in sorted(self.cfg.leases.glob("*.lock")):
-            try:
-                owner = (d / "owner").read_text().splitlines()
-            except Exception:
-                owner = []
-            out[d.stem] = {"owner": owner[0] if owner else "?",
-                           "since": owner[1] if len(owner) > 1 else "?"}
+        try:
+            from leases import Leases
+            L = Leases(self.cfg)
+            for name in L.res:
+                for p, info in L.holders(name):
+                    out[p.name[:-5]] = {"owner": info.get("owner", "?"), "since": info.get("since", "?")}
+        except Exception:
+            pass
         return out
 
     # -- queue -----------------------------------------------------------
     def parse_lane(self, lane: str) -> List[Row]:
-        f = self.cfg.instance / f"queue_{lane}.tsv"
-        rows: List[Row] = []
-        if not f.is_file():
-            return rows
-        for line in f.read_text(errors="replace").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = re.split(r"\s+", line, maxsplit=5)
-            if len(parts) < 5:
-                continue
-            rid, deps, gate, qexec, plan = parts[:5]
-            extra = re.split(r"[,\s]+", parts[5].strip()) if len(parts) > 5 else []
-            rows.append(Row(lane=lane, id=rid,
-                            deps=[] if deps == "-" else deps.split(","),
-                            gate=(gate == "1"), queue_exec=qexec, plan=plan,
-                            extra_allow=[e for e in extra if e]))
-        return rows
+        return [self._row(q) for q in parse_file(self.cfg.instance / f"queue_{lane}.tsv", lane) if not q.problems]
+
+    @staticmethod
+    def _row(q) -> Row:
+        return Row(lane=q.lane, id=q.id, deps=list(q.deps), gate=q.gate, queue_exec=q.queue_exec,
+                   plan=q.plan, extra_allow=list(q.extra_allow), meta=dict(q.meta))
 
     # -- resolution ------------------------------------------------------
     def resolve(self) -> Dict[str, Any]:
-        lanes = self.cfg.lanes()
-        all_rows: List[Row] = []
-        for lane in lanes:
-            all_rows.extend(self.parse_lane(lane))
-        by_id = {r.id: r for r in all_rows}
+        lanes = active_lanes(self.cfg)
+        qrows, by_q = load_rows(self.cfg)
+        implicit = implicit_deps(self.cfg, qrows)
+        all_rows = [self._row(q) for q in qrows if not q.archived and not q.problems]
         now = int(time.time())
         allowed = set(self.cfg.data["executors"]["allowed"])
         try:
             stall = int(self.cfg.data["lanes"]["stall_warning_seconds"])
         except Exception:
             stall = 2700
+        try:
+            notes = json.loads((self.cfg.state / "sched.json").read_text())
+        except Exception:
+            notes = {}
         default = self.cfg.data["executors"]["default"]
 
         for r in all_rows:
             r.sentinel, r.note = self.sentinel(r.id)
+            r.phase = self.st.phase(r.id)
+            res = self.st.result(r.id)
+            d = self.st.dispatch(r.id)
+            r.attempt = int(d.get("attempt", 0) or 0)
             ov = self.override(r.id)
             if ov and ov in allowed:
                 r.executor, r.exec_source = ov, "override"
@@ -256,60 +214,60 @@ class Resolver:
                 r.executor = r.queue_exec if r.queue_exec in allowed else default
                 r.exec_source = "queue"
             r.live_window = self.alive(r.id)
-            try:
-                r.unblock_n = int((self.cfg.state / f"{r.id}.unblock_n").read_text().strip())
-            except Exception:
-                r.unblock_n = 0
+            r.unblock_n = self.st.read_int(f"{r.id}.unblock_n", 0)
             for name in self.windows:
                 if name.startswith(f"ub-{r.id}-"):
                     r.unblock_window = name
-            r.unmet_deps = [d for d in r.deps if self.sentinel(d)[0] != "CLOSED"]
+                if name.startswith(f"rv-{r.id}-"):
+                    r.review_window = name
+            r.unmet_deps = unmet_deps(self.st, r, implicit)
             if r.live_window:
                 w = self.windows[r.id]
                 r.idle_secs = max(0, now - w["activity"]) if w["activity"] else -1
-
-            # ---- state precedence -------------------------------------
-            # 1. CLOSED is TERMINAL and wins over any residual live window.
-            #    A finished session left open (e.g. a Claude TUI that never
-            #    /exit'd after writing its sentinel) is a zombie, not proof of
-            #    work — the lane has already moved on. Reading it as RUNNING
-            #    made every read-only surface show a closed row as running.
-            # 2. otherwise a live window WE DISPATCHED is the row running,
-            #    whatever the (non-terminal) sentinel says; a live window we
-            #    did not is an orphan, and a silent one is QUIET, not work.
             r.window_ours = r.live_window and self.window_is_ours(r.id)
-            if r.sentinel == "CLOSED":
+            r.why = str(res.get("why", "") or notes.get(r.id, ""))
+            ph = r.phase
+            if ph == "accepted":
                 r.state = "CLOSED"
-            elif r.unblock_window:
+            elif ph == "verifying" or ph == "claimed":
+                r.state = "VERIFYING"
+            elif ph == "reviewing":
+                r.state = "REVIEWING"
+            elif ph == "unblocking" or r.unblock_window:
                 r.state = "UNBLOCKING"
+            elif ph in ("blocked", "blocked_claim"):
+                r.state = "BLOCKED"
+            elif ph == "route_a":
+                r.state = "ROUTE_A"
+            elif ph == "halted":
+                r.state = "HALTED"
+            elif ph == "spend_wait":          # lib/spend.py: waits for the Owner's spend answer
+                r.state = "SPEND_WAIT"
             elif r.live_window and not r.window_ours:
                 r.state = "ORPHAN"
-            elif r.live_window:
-                r.state = "QUIET" if (0 <= stall < r.idle_secs) else "RUNNING"
-            elif r.sentinel in HALTING:
-                r.state = r.sentinel
-            elif r.sentinel != "NONE":
-                r.state = "HALTED"          # unrecognized sentinel
-            elif r.gate and not self.gate_open(r.id):
+            elif r.live_window and d.get("open"):
+                if self.st.has(f"{r.id}.limited"):
+                    r.state = "LIMITED"
+                else:
+                    r.state = "QUIET" if (0 <= stall < r.idle_secs) else "RUNNING"
+            elif d.get("open") and d.get("executor") == "manual":
+                r.state = "MANUAL"
+            elif r.gate and not self.gate_open(r.id) and not r.unmet_deps:
                 r.state = "GATED"
             elif r.unmet_deps:
                 r.state = "WAITING"
-            elif r.executor == "manual":
-                r.state = "MANUAL"
+            elif not self.enabled(r.lane):
+                r.state = "DISABLED"
             elif self.paused(r.lane):
                 r.state = "PAUSED"
+            elif r.executor == "manual":
+                r.state = "MANUAL"
+            elif str(notes.get(r.id, "")).startswith("READY"):
+                r.state = "READY"
             else:
                 r.state = "PENDING"
-
-        # A gate far down a lane is not "before" anything yet: the watcher parks
-        # on a gate only when that row is the lane's next row. Until then the
-        # row waits on its deps like any other, so status/dashboard never say
-        # "GATE HOLD before int1" while setup is running .
-        for lane in lanes:
-            first_open = next((r for r in all_rows if r.lane == lane and r.state != "CLOSED"), None)
-            for r in all_rows:
-                if r.lane == lane and r.state == "GATED" and r.unmet_deps and r is not first_open:
-                    r.state = "WAITING"
+            if ph == "retry" and r.state == "PENDING":
+                r.why = r.why or "re-dispatch pending"
 
         lane_view = []
         for lane in lanes:
@@ -323,6 +281,7 @@ class Resolver:
                 "closed": sum(1 for r in rows if r.state == "CLOSED"),
                 "total": len(rows),
                 "watcher": self.watcher_running(lane),
+                "enabled": self.enabled(lane),
                 "paused": self.paused(lane),
                 "stopped": self.stopped(lane),
                 "next": open_rows[0].id if open_rows else "",
@@ -334,7 +293,9 @@ class Resolver:
             "name": self.cfg.name,
             "tmux": self.cfg.tmux_session,
             "instance": str(self.cfg.instance),
+            "engine": self.engine_alive(),
             "lanes": lane_view,
+            "archived_lanes": archived_lanes(self.cfg),
             "live_windows": sorted(self.windows),
             "leases": self.leases(),
             "gates": sorted(p.name for p in self.cfg.control.glob("GO_*")) if self.cfg.control.is_dir() else [],
@@ -349,36 +310,41 @@ class Resolver:
         if not open_rows:
             return "LANE COMPLETE — every row CLOSED", ""
         # focus follows the live pane first (rule 1), else worst state
-        live = [r for r in open_rows if r.state in ("RUNNING", "UNBLOCKING", "QUIET")]
+        live = [r for r in open_rows if r.state in ("RUNNING", "UNBLOCKING", "QUIET", "LIMITED", "REVIEWING")]
         if live:
             r = live[0]
-            what = r.unblock_window or r.id
+            what = r.unblock_window or r.review_window or r.id
             quiet = f" · no output for {r.idle_secs // 60} min" if r.state == "QUIET" else ""
             return (f"{r.state} {r.id} (executor {r.executor}"
                     f"{', assigned' if r.exec_source == 'override' else ''}){quiet}"), what
         worst = sorted(open_rows, key=lambda r: rank.get(r.state, 99))[0]
         msg = {
-            "ESCALATED": f"HALTED — {worst.id} returned ESCALATED",
+            "ROUTE_A": f"HALTED — {worst.id} returned ROUTE_A",
             "BLOCKED": f"HALTED — {worst.id} returned BLOCKED",
-            "HALTED": f"HALTED — {worst.id} carries sentinel '{worst.sentinel}'",
             "ORPHAN": (f"ORPHAN WINDOW — a session this rig did not dispatch holds the "
                        f"name '{worst.id}' and is not working it. Close it "
                        f"(tmux kill-window -t {self.cfg.tmux_session}:{worst.id}) and the "
                        f"lane dispatches by itself · or claim it: orch adopt {worst.id}"),
-            "GATED": f"GATE HOLD before {worst.id} — release: orch approve {worst.id}",
+            "GATED": f"HARD PAUSE before {worst.id} — release: orch approve {worst.id}",
+            "SPEND_WAIT": f"WAITING FOR MONEY — {worst.id}: {worst.why}",
+            "HALTED": f"HALTED — {worst.id}: {worst.why or worst.sentinel}",
+            "VERIFYING": f"verifying {worst.id}'s close claim",
+            "READY": f"READY {worst.id} — {worst.why}",
+            "DISABLED": f"lane not started — orch start {lane}",
             "MANUAL": f"WAITING FOR OPERATOR — {worst.id} is a manual row",
             "PAUSED": f"PAUSED before {worst.id} (orch resume to continue)",
             "WAITING": f"waiting on deps [{','.join(worst.unmet_deps)}] for {worst.id}",
             "PENDING": (f"IDLE — next unstarted: {worst.id}"
-                        if not self.watcher_running(lane) else f"dispatching {worst.id}"),
+                        if not self.watcher_running(lane) else f"dispatching {worst.id}"
+                        + (f" ({worst.why})" if worst.why else "")),
         }.get(worst.state, f"{worst.state} {worst.id}")
         # Any state whose exit needs the watcher must say so when there is none.
         # A halted lane whose watcher has exited used to read exactly like one
         # still being babysat.
         if not self.watcher_running(lane) and worst.state in (
                 "PENDING", "WAITING", "GATED", "ORPHAN",
-                "BLOCKED", "ESCALATED", "HALTED"):
-            msg += "  [no watcher — 'orch start']"
+                "BLOCKED", "ROUTE_A", "HALTED", "READY"):
+            msg += "  [engine down — 'orch start']" if not self.engine_alive() else "  [lane not started — 'orch start " + lane + "']"
         return msg, worst.id
 
 
@@ -396,16 +362,10 @@ class Resolver:
         Entries 1, 2, 4 and 5 are workspace-relative; they are re-based onto
         the guard's git repo, which is often a parent of the workspace.
         """
-        row = None
-        for lane in self.cfg.lanes():
-            for r in self.parse_lane(lane):
-                if r.id == rid:
-                    row = r
-                    break
-            if row:
-                break
-        if row is None:
+        q = find_row(self.cfg, rid)
+        if q is None:
             return []
+        row = self._row(q)
         pre = self.cfg.repo_prefix
         def rebase(p: str) -> str:
             p = p.strip().lstrip("./")
@@ -462,7 +422,7 @@ class Resolver:
             out.append("--- controls ---")
             out.append(" ".join(ctl))
         ev = []
-        for lane in self.cfg.lanes():
+        for lane in active_lanes(self.cfg):
             f = self.cfg.state / f"events_{lane}.log"
             if f.is_file():
                 try:

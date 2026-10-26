@@ -9,8 +9,8 @@ Thanks for helping make `orch` better. Ideas, bug reports and patches are all we
   in your own `prompts/`, not in `lib/`.
 - **No project-specific code in `lib/`.** No names, paths, tickets or domain
   words. If a fix only makes sense for one project, it is a preset.
-- **Every behaviour change comes with a test** in `tests/test_mock_cycle.sh`
-  (or a focused pytest file). Never weaken or delete an assertion to get green.
+- **Every behaviour change comes with a test** in `tests/` (the suite that owns
+  the mechanism). Never weaken or delete an assertion to get green.
 - **Keep it dependency-light:** bash, Python 3 stdlib, tmux, git. Optional TUI
   extras may use `rich`.
 
@@ -25,9 +25,11 @@ Thanks for helping make `orch` better. Ideas, bug reports and patches are all we
 ```bash
 bash -n bin/orch lib/*.sh lib/adapters/*.sh tests/*.sh
 python3 -m py_compile lib/*.py
-tests/test_mock_cycle.sh      # isolated sandbox, no models, no network
-python3 -m pytest tests -q
+tests/run_all.sh              # every suite; isolated sandboxes, no models, no network
 ```
+
+`tests/run_all.sh` stamps `.tested/<commit>` on a clean tree; `orch start`
+refuses a dirty framework tree (`ORCH_ALLOW_DIRTY=1` overrides on the record).
 
 The mock-cycle test uses its own unique tmux session and temp directory. To
 isolate it completely, run it with `TMUX_TMPDIR=$(mktemp -d)`.

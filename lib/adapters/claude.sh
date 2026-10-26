@@ -15,7 +15,7 @@ id=$1 model=$2 order=$3
 # A pinned model id (executors.models.<executor> in orch.yaml -> ORCH_MODEL_<EXECUTOR>)
 # wins over the bare alias, so a CLI alias move cannot silently change a tier.
 pin="ORCH_MODEL_${model^^}"
-model="${!pin:-$model}"
+model="${ORCH_VARIANT_MODEL:-${!pin:-$model}}"   # an executor variant's own model (executors.variants.<n>.model) wins
 flags="${ORCH_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 . "$(dirname "$(dirname "${BASH_SOURCE[0]}")")/closing.sh"
 seal_on_exit(){
@@ -23,5 +23,6 @@ seal_on_exit(){
     && echo "[orch] sealed $id from its closing line (the status file was not written by the session)" >&2
 }
 trap seal_on_exit EXIT
+eval "extra=(${ORCH_EXTRA_ARGS:-})"   # executors.args (e.g. --effort high)
 # shellcheck disable=SC2086
-"${ORCH_BIN_CLAUDE:-claude}" --model "$model" $flags "$(cat "$order")"
+"${ORCH_BIN_CLAUDE:-claude}" --model "$model" $flags "${extra[@]}" "$(cat "$order")"

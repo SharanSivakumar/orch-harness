@@ -1,0 +1,1 @@
+UNATTENDED reminder from the orchestration engine: nobody answers in this window. Your `./orch sw` actions are staged; write your proposal (the file your work order names), then record your verdict with: __VERDICTCMD__ (RESOLVED when the proposal is ready, PARKED, INBOX or ESCALATE). Then make no further tool calls.

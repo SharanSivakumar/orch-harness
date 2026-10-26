@@ -7,4 +7,6 @@ gm=$(cat "$ORCH_INSTANCE/control/GEMINI_MODEL_$id" 2>/dev/null || true)
 : "${gm:=${ORCH_MODEL_GEMINI:-gemini-3.7-flash-high}}"
 flags="${ORCH_GEMINI_FLAGS:---dangerously-skip-permissions}"
 # shellcheck disable=SC2086
-exec "${ORCH_BIN_GEMINI:-agy}" --model "$gm" $flags -i "$(cat "$order")"
+eval "extra=(${ORCH_EXTRA_ARGS:-})"
+# shellcheck disable=SC2086
+exec "${ORCH_BIN_GEMINI:-agy}" --model "$gm" $flags "${extra[@]}" -i "$(cat "$order")"

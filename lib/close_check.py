@@ -35,10 +35,15 @@ the line-leading forms count: `STOP …`, `REFUSED …`, `label: HEADS_UNCHANGED
 line; the instrument output it quotes is scanned on its own.
 
 The escape is a signed ruling: a line in the row's PROGRESS.md
-    SIGNED_RULING <ruling-id>          e.g.  SIGNED_RULING DEC-12
+    SIGNED_RULING <ruling-id>          e.g.  SIGNED_RULING DEC-266
 whose entry exists in <workspace>/DECISIONS.md (a `### <ruling-id> ` heading)
-and is signed: its block carries `RATIFIED` or `RULED`. A PROPOSED or
-PROVISIONAL entry is not a signature.
+and is signed BY ITS OWN HEADING OR STATUS LINE: `RATIFIED` or `RULED` there,
+never merely quoted in the body. A PROPOSED or PROVISIONAL entry is
+not a signature. A table-row ledger (`| DEC-014 | RULED … |`) signs when the
+cell after the id opens with RULED/RATIFIED and it is not superseded (v3). A
+Steward ruling `SIGNED_RULING SW-<k>` signs a stop line only when the engine's
+state/steward/rulings.jsonl holds it with class S or P and it is about the row;
+it never covers a protected path (lib/protected.py).
 
 usage: close_check.py <row-id>     exit 0 PASS · 3 REFUSE · 2 cannot run
 Output: counts, and each hit as <path>:<line>: <first 160 chars of the line>.
@@ -80,15 +85,9 @@ def never_open(rel: Path) -> bool:
 
 
 def row_plan(cfg, rid: str) -> Optional[str]:
-    for lane in cfg.lanes():
-        q = cfg.instance / f"queue_{lane}.tsv"
-        if not q.is_file():
-            continue
-        for line in q.read_text(errors="replace").splitlines():
-            parts = line.split()
-            if len(parts) >= 5 and parts[0] == rid and not parts[0].startswith("#"):
-                return parts[4]
-    return None
+    from rows import find_row
+    r = find_row(cfg, rid)
+    return r.plan if r and r.plan else None
 
 
 def evidence_roots(cfg, rid: str) -> List[Path]:
@@ -135,24 +134,134 @@ def scan(roots: List[Path]) -> Tuple[List[str], int, int]:
     return hits, files, skipped
 
 
-def signed_ruling(cfg, roots: List[Path]) -> Tuple[Optional[str], str]:
-    """-> (ruling id if a PROGRESS names a signed one, note)."""
+def signed_ruling(cfg, roots: List[Path], owner_only: bool = False,
+                  rid: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """-> (ruling id if a PROGRESS names a signed one, note).
+
+    An Owner ruling is signed in <workspace>/DECISIONS.md — a `### <id>` heading entry or a
+    table-row entry (`| DEC-014 | RULED … |`), both read through lib/decisions.py. A Steward
+    ruling `SW-<k>` signs only a stop line (never with `owner_only`), only from the engine's own
+    record (state/steward/rulings.jsonl, class S or P), and only for the row it is about (`rid`
+    named in its title or text, or the subject of its incident); a `SW-` id written into
+    DECISIONS.md signs nothing. Protected paths use lib/protected.py's stricter owner_ruling."""
     named: List[str] = []
     for root in roots:
         p = root / "PROGRESS.md"
         if p.is_file():
             named += SIGNED_LINE.findall(p.read_text(errors="replace"))
+    named = list(dict.fromkeys(named))
     if not named:
         return None, "no SIGNED_RULING line in PROGRESS.md"
-    dec = cfg.workspace / "DECISIONS.md"
-    if not dec.is_file():
-        return None, f"SIGNED_RULING names {named[0]} but there is no DECISIONS.md"
-    text = dec.read_text(errors="replace")
-    for rid in named:
-        m = re.search(rf"^###\s+{re.escape(rid)}\b.*?(?=^###\s|\Z)", text, re.M | re.S)
-        if m and re.search(r"\bRATIFIED\b|\bRULED\b", m.group(0)):
-            return rid, f"{rid} is signed in DECISIONS.md"
-    return None, f"SIGNED_RULING names {', '.join(named)} but none is a signed (RATIFIED/RULED) entry"
+    notes: List[str] = []
+    sw = [r for r in named if r.startswith(STEWARD_PREFIX)]
+    owner = [r for r in named if not r.startswith(STEWARD_PREFIX)]
+    for k in sw:
+        if owner_only:
+            notes.append(f"{k} is a Steward ruling — only an Owner ruling covers a protected path")
+            continue
+        rec = steward_record(cfg, k)
+        if not rec or str(rec.get("class", "")).upper() not in ("S", "P"):
+            notes.append(f"{k} is not a class S/P ruling in state/steward/rulings.jsonl")
+        elif not rid or not steward_scoped(cfg, rec, rid):
+            notes.append(f"{k} is about another subject (it names neither {rid} nor an incident on it)")
+        else:
+            return k, f"{k} is a class-{str(rec['class']).upper()} Steward ruling on {rid} (state/steward/rulings.jsonl)"
+    if owner:
+        dec = cfg.workspace / "DECISIONS.md"
+        if not dec.is_file():
+            notes.append(f"SIGNED_RULING names {owner[0]} but there is no DECISIONS.md")
+        else:
+            text = dec.read_text(errors="replace")
+            for k in owner:
+                if entry_signed(text, k) or table_signed(dec, k):
+                    return k, f"{k} is signed in DECISIONS.md"
+            notes.append(f"SIGNED_RULING names {', '.join(owner)} but none is a signed (RATIFIED/RULED) entry")
+    return None, "; ".join(notes)
+
+
+STEWARD_PREFIX = "SW-"
+
+
+def steward_record(cfg, k: str) -> Optional[dict]:
+    try:
+        import steward
+        return steward.steward_ruling(cfg, k)
+    except Exception:
+        return None
+
+
+def steward_scoped(cfg, rec: dict, rid: str) -> bool:
+    """A Steward ruling is about `rid` when its title/text names it or its incident's subject is it."""
+    pat = re.compile(rf"(?<![\w-]){re.escape(rid)}(?![\w-])")
+    if pat.search(f"{rec.get('title', '')}\n{rec.get('text', '')}"):
+        return True
+    try:
+        import json
+        inc = json.loads((cfg.state / "steward" / "incidents" / f"{rec.get('incident')}.json").read_text())
+        return str(inc.get("subject", "")) == rid
+    except Exception:
+        return False
+
+
+def table_signed(dec: Path, rid: str) -> bool:
+    """A table-row ledger entry (`| <id> | RULED (…) — … |`) signs when table_entry_signed holds and
+    the entry is not superseded or withdrawn. Heading entries are judged by entry_signed."""
+    try:
+        import decisions
+        entries = decisions.find(decisions.load_entries(dec), rid)
+    except Exception:
+        return False
+    return any(e.kind == "table" and e.active and table_entry_signed(e) for e in entries)
+
+
+def table_entry_signed(e) -> bool:
+    """The cell after the id OPENS with RULED/RATIFIED (its first token, markdown emphasis aside) and
+    that is the entry's status (decisions.STATUS) — so PROPOSED/ADOPTED/REJECTED/OPEN, «to be RULED»
+    and «DEC-14 RATIFIED by …» (another id's status) never sign."""
+    import decisions
+    if e.kind != "table" or e.status not in ("RULED", "RATIFIED"):
+        return False
+    m = decisions.TABLE_ROW.match(e.head)
+    cell = (m.group(2) if m else "").split("|", 1)[0]
+    lead = re.sub(r"^[\s*_`]+", "", cell)[:200]
+    first = decisions.STATUS.search(lead)
+    return bool(first and first.group(1).upper() in ("RULED", "RATIFIED") and first.start() == 0)
+
+
+SIGNED_WORD = re.compile(r"\b(RATIFIED|RULED)\b")
+UNSIGNED_WORD = re.compile(r"\b(PROPOSED|PROVISIONAL|DRAFT|WITHDRAWN|SUPERSEDED)\b")
+STATUS_LINE = re.compile(r"^\s*(?:[*_>\-\s]*)(?:status|verdict|ruling)\s*[*_]*\s*[:=—-]", re.I)
+
+
+def entry_signed(text: str, rid: str) -> bool:
+    """A ruling is signed only when the entry ITSELF says so: its heading
+    carries RULED/RATIFIED and no PROPOSED/PROVISIONAL/DRAFT, or — for headings that
+    carry no status — one of the first lines of its body is a status line (or opens
+    with a bold «… RULED.» declaration). A PROPOSED entry that merely quotes the word
+    RULED somewhere in its body is not a signature."""
+    for m in re.finditer(rf"^###\s+{re.escape(rid)}\b(.*?)(?=^###\s|\Z)", text, re.M | re.S):
+        block = m.group(0)
+        heading = block.splitlines()[0]
+        if UNSIGNED_WORD.search(heading):
+            continue
+        if SIGNED_WORD.search(heading):
+            return True
+        body = [l for l in block.splitlines()[1:] if l.strip()][:3]
+        for line in body:
+            lead = line.strip()[:200]
+            if UNSIGNED_WORD.search(lead[:80]):
+                break
+            m2 = STATUS_LINE.match(line)
+            if m2:
+                value = line[m2.end():].strip(" *_`")
+                if re.match(r"(RATIFIED|RULED)\b", value):
+                    return True
+                break
+            if lead.startswith("**"):
+                bold = lead[2:].split("**", 1)[0]
+                if re.search(r"\b(RATIFIED|RULED)\W*$", bold) and not UNSIGNED_WORD.search(bold):
+                    return True
+    return False
 
 
 def main() -> int:
@@ -164,7 +273,7 @@ def main() -> int:
         cfg = load()
         roots = evidence_roots(cfg, rid)
         hits, files, skipped = scan(roots)
-        ruling, note = signed_ruling(cfg, roots) if hits else (None, "not needed")
+        ruling, note = signed_ruling(cfg, roots, rid=rid) if hits else (None, "not needed")
     except SystemExit:
         raise
     except Exception as e:  # never a silent pass

@@ -1,15 +1,36 @@
 # strict preset
 
-The framework's generic work orders plus the clauses a long unattended run
-earns the hard way:
-
-- a **never-open** clause for secret-bearing files, passed down to every subagent charter;
-- the **long-run** helper and shared-venv check for jobs over five minutes;
-- the **close check** before a row may be closed `CLOSED`.
-
     orch init my-rig --preset strict
 
-The files are copied into the instance's `prompts/`, where they override the
-framework defaults. Edit them freely: they are yours from that moment on.
-Add your own domain rules the same way: copy `templates/_TEMPLATE_LEAD.md`
-into your instance and write your doctrine into it.
+A guarded starting point for a project whose rows must never invent facts,
+weaken a check, or leak private material. `orch init` copies the `_*` files and
+this README into the instance's `prompts/`, where they override the framework's
+generic templates, and applies `setup.defaults.yaml` to the new `orch.yaml`.
+
+The preset is deliberately thin. It carries **mechanism** (the never-open
+clause, the block protocol, the close checks, the work-order shape) and a
+doctrine skeleton you fill in for your project. Project-specific rules belong in
+the workspace, never in these files.
+
+## Layout
+
+- `_PART_doctrine.md` — the permanent doctrine: North Star placeholder, the
+  never-list, Route A / Route B, long jobs. Every work order includes it with
+  `{{> doctrine}}`. **Fill in the North Star before the first run.**
+- `_PART_never_open.md` — the verbatim never-open clause every subagent charter
+  carries.
+- `_TEMPLATE_*.md` / `_KICK_*.txt` — thin overrides that include the parts and
+  the framework's shared `read_first`, `honesty` and `close` parts.
+- `setup.defaults.yaml` — the standing preferences applied to `orch.yaml`
+  (documented in the file; edit freely).
+
+## What the project supplies — and where
+
+- `<workspace>/rules/BASE.md` — the project's standing rules (paths, secrets,
+  resources, the wall). Every work order points at it.
+- `<instance>/rounds/<tag>/RULES.md` — a round's delta (`orch round new <tag>`).
+- `<workspace>/DECISIONS.md` — the ruling ledger. Rows read only the rulings
+  their PLAN lists on a `Rulings:` line and look others up with
+  `orch gd show <id>`. Ids come from `orch gd next --reserve`.
+- `guard.compliance_scanners` — project code that refuses a commit containing
+  material the project treats as private. The framework ships no scanner.

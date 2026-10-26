@@ -1,335 +1,442 @@
 # orch-harness
 
-A standalone, repo-agnostic rig for running a ladder of work across many AI
-agents in parallel, where each agent is a **visible tmux session you can watch
-at any moment** and each step closes itself with a **sentinel file**.
+**Run a ladder of work across many AI agents in parallel — each one a visible
+tmux window, each claim verified before anything that depends on it starts.**
 
-Born in a long-running multi-agent project where the same machinery was
-copied and re-debugged into every new work folder. Here it is configuration,
-not code: a project supplies an `orch.yaml`, a queue file, and its plans.
+[![CI](https://github.com/SharanSivakumar/orch-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/SharanSivakumar/orch-harness/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/SharanSivakumar/orch-harness)](https://github.com/SharanSivakumar/orch-harness/releases)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+`orch-harness` is a repo-agnostic orchestration rig for long-running agent work.
+A project brings an `orch.yaml`, queue files and plans; this repository supplies
+the engine. Rows are the unit of work: an id, its dependencies, a plan path and
+an executor. The engine dispatches ready rows into named tmux windows, watches
+them, checks their close claims, gets independent review where configured, and
+only then lets dependents run.
+
+It is deliberately **not** a chat UI, a prompt library, or a hosted service. It
+is the scheduler, the guard rails and the paper trail around the agent CLIs you
+already use.
+
+![orch monitor](docs/images/monitor.png)
 
 ---
 
-## What it does
+## What it looks like
 
-- **Multi-lane DAG scheduling.** Lanes run in parallel; rows within a lane run
-  in file order behind their declared dependencies. The queue is re-read on
-  every pass, so **appending or editing rows while it runs is safe** and is the
-  intended workflow.
-- **Runtime executor retiering.** Any pending row can be moved between `opus`,
-  `sonnet`, `haiku`, `hermes`, `hermesflash`, `hermespro`, `codex`, `gemini`,
-  `opencode`, `manual` and `mock` without editing the queue. The executor is
-  resolved at dispatch time. `hermes` and `hermesflash` are two scoped Hermes
-  tiers with their own model pins (`executors.models.hermes[_provider]` and
-  `executors.models.hermesflash[_provider]`); both share `executors.bin.hermes`.
-  `opencode` is a scoped OpenCode TUI pinned by `executors.models.opencode`
-  (model id) and `opencode_provider`, launched as `-m <provider>/<model> --auto
-  --prompt …`; the TUI submits the prompt itself, so no tmux paste is involved.
-  List it in `executors.arg_kick` to launch it on the row's kick text instead of
-  the full work order; an executor's own `_KICK_<EXECUTOR>.txt` wins over its
-  flavor's `_KICK_<FLAVOR>.txt`. Point `executors.bin.opencode` at a rig-local
-  launcher that exports `OPENCODE_CONFIG` for deny rules, `share` and
-  `autoupdate`. **A running watcher keeps the `orch.yaml` it started with**:
-  after adding an executor, restart the lane watchers (`orch stop` → wait for
-  `HALTED (STOP)` → `orch unstop` → `orch start <lanes>`), or an unknown
-  executor resolves to `executors.default`.
-- **Visible sessions only.** Never headless. `tmux attach` and watch any agent.
-- **Sessions are identified, not just named.** A window wearing a row's name is
-  not evidence the row is being worked — a *finished* session left open after
-  `orch reset` wears the same name. Dispatch stamps the tmux identity it created
-  (`state/<id>.window`); a live window that does not match is an **ORPHAN**, and
-  the lane waits with its hands off it rather than reporting RUNNING. Close the
-  window and the lane dispatches by itself; `orch adopt <id>` claims one you
-  know is genuinely working.
-- **Hard gates.** A row marked `1` stops the lane until a human runs
-  `orch approve <id>`.
-- **Self-healing.** A scoped-tier row that returns `BLOCKED` gets an automatic
-  unblocker session that diagnoses the stop, fixes the *plan*, and re-runs the
-  row. After N attempts it retiers instead of paging; if the retiered row
-  blocks again, the lane halts.
-- **Concurrency leases + a git staging firewall.** Sessions may overlap; they
-  may not overlap *on a resource*, and no session can stage another's files.
-- **One state, three surfaces.** A Rich TUI dashboard, a `status` line, and a
-  Telegram bot all read through the same resolver, so they cannot disagree.
+The screenshot above is `orch monitor`: a one-second, read-only glance at a whole
+rig — what is running, which lane heads are next, what needs you, and what is
+holding progress.
 
-## What it deliberately does not do
+`orch dashboard` — the default compact view. It adapts to short terminals and
+keeps every lane visible; `focused` and `full` expand the ladders.
 
-It does not decide anything. It has no opinion about your tiers, your review
-gates, your definition of done, or what a row is allowed to spend. All of that
-lives in your plans and your prompt templates.
+![orch dashboard](docs/images/dashboard.png)
+
+`orch dashboard focused --lane A` — one lane's full ladder plus a live,
+read-only capture of the running session.
+
+![orch dashboard focused](docs/images/dashboard-focused.png)
+
+`orch status full` — the same resolved state without a TUI. It is the
+authoritative answer for scripts, the Telegram bot and `orch json`.
+
+![orch status full](docs/images/status.png)
+
+The screenshots come from a four-lane demo rig. `orch init` starts you with one
+lane (`queue_A.tsv`); every additional `queue_<L>.tsv` becomes another lane.
+
+---
+
+## Why it exists
+
+Running many agents in parallel usually fails in the same four places:
+
+1. **You cannot see them.** A headless batch tells you a row "finished"; it does
+   not tell you whether the work is true. Here every session is a real tmux
+   window. `orch attach` and watch any one.
+2. **A bare sentinel is treated as success.** An agent can print `CLOSED` over a
+   failed test. Here a claim is **judged**: stop lines, `PROGRESS.md`, acceptance
+   probes, commits and protected paths are checked, and (by policy) an
+   independent reviewer on a different model re-verifies the claim.
+3. **A crash takes the whole rig down.** Here an interrupted session is detected
+   (boot id, tmux session age) and re-dispatched without being charged; dead
+   windows are recorded; executor breakers stop a broken CLI from burning the
+   whole ladder.
+4. **Someone must babysit every halt.** The optional **Steward lane** turns
+   halts, held gates, waiting manual rows and rest states into incidents it can
+   resolve through engine-checked actions, each logged with its undo. Only the
+   page classes you allow reach your phone.
+
+The engine is one Python process per rig (`tick_seconds`), not one watcher per
+lane. Config edits are picked up live.
+
+---
+
+## How a row runs
+
+```mermaid
+flowchart TD
+  Q[queue_L.tsv] --> E{engine tick}
+  E -->|deps accepted, gate open, capacity, RAM, disk, resource slots| T[tmux window named for the row]
+  T --> X[executor: opus · sonnet · haiku · opencode · gemini · codex · manual · mock]
+  X -->|writes PROGRESS.md, commits through the guard| D[orch done id summary]
+  D --> C[close checks now: stop lines, progress, probe, commit]
+  C -->|refused| F[fix and retry, block, or unblock]
+  C -->|passes| R{review policy}
+  R -->|none| A[ACCEPTED]
+  R -->|review| V[rv-id-n on a different executor]
+  V -->|ACCEPT| A
+  V -->|REJECT| F
+  A --> N[dependents may start · metric · window reaped]
+```
+
+A `BLOCKED` claim from a junior row gets an unblocker session (`ub-<id>-<n>`)
+that fixes the *plan*, not the deliverable. After the configured attempts the
+row is retiered once; a further block halts it and pages you. A `ROUTE_A`
+escalation always halts.
 
 ---
 
 ## Install
 
-Nothing to build. Requirements: `bash`, `tmux`, `python3`, `pyyaml`, and
-`rich` (dashboard only). Optionally put the CLI on your PATH:
+Requirements: `bash`, `tmux` ≥ 3, `python3` ≥ 3.10, `pyyaml`, and `rich` for the
+TUI.
 
 ```bash
-ln -s /path/to/orch-harness/bin/orch ~/.local/bin/orch
+git clone https://github.com/SharanSivakumar/orch-harness.git ~/orch-harness
+ln -s ~/orch-harness/bin/orch ~/.local/bin/orch
+orch version
 ```
+
+Nothing is built and no daemon is installed. The only optional system service is
+`orch service install` (systemd user units) for reboot survival.
+
+Optional first step after cloning: `tests/run_all.sh` stamps `.tested/<commit>`,
+which tells `orch start` this checkout has passed its suites. It is not required
+to try the rig.
+
+Keep instances outside the framework checkout: `orch start` refuses to run from
+a dirty framework tree, so do not `orch init` inside `~/orch-harness`.
 
 ## Five-minute start
 
 ```bash
-orch init docs/rig --name "My project" --session myproject
-cd docs/rig
-$EDITOR orch.yaml queue_A.tsv     # see the guide below
-./orch lint                       # validate before dispatching anything
-./orch start                      # watchers come up in tmux
-./orch dashboard                  # watch it
+orch init ~/projects/my-rig/ORCH --name "My project" --session myrig
+cd ~/projects/my-rig/ORCH
+
+$EDITOR orch.yaml queue_A.tsv      # a lane, a few rows (see below)
+./orch lint                        # validate before dispatching anything
+./orch start                       # bring the engine up in tmux
+./orch monitor                     # watch it, read-only (Ctrl-C to leave)
 ```
 
-Every instance gets an `./orch` wrapper that pins itself, so agents can call
-the CLI from anywhere without knowing where the framework lives.
+A fresh instance starts with:
+
+```text
+ORCH/
+  orch.yaml            instance config
+  queue_A.tsv          lane A ladder (any queue_<L>.tsv is a lane)
+  orch                 self-locating CLI wrapper (safe to commit)
+  prompts/             per-instance work-order templates (win over the framework's)
+  state/               claims, results, dispatch records, telemetry
+  control/             RUN_<lane>, PAUSE, STOP, GO_<row>, …
+  leases/  unblock/
+```
+
+As it runs, it also grows `archive/`, `rounds/`, `steward/`, `digest/` and
+`reviews/`.
+
+For a guided setup with a human, an agent follows
+[`docs/SETUP_AGENT_GUIDE.md`](docs/SETUP_AGENT_GUIDE.md); for planning the work
+itself, [`docs/PLANNING_AGENT_GUIDE.md`](docs/PLANNING_AGENT_GUIDE.md).
 
 ---
 
-## The three paths, and why there are three
+## The three paths
 
-The single most common source of confusion in the old rig was collapsing these:
+The most common setup mistake is collapsing these. They are separate on purpose:
 
 | Setting | What it is | Example |
 |---|---|---|
-| `instance` | the folder holding `orch.yaml`, state, control, prompts | `docs/rig` |
-| `project.workspace` | what queue plan paths and reports are relative to | `docs` |
-| `project.root` | every executor's working directory | `$HOME/projects/app` |
-| `guard.git_repo` | the repo the guard stages and commits into | `docs` |
+| `instance` | the folder holding `orch.yaml`, state, control and prompts | `~/projects/my-rig/ORCH` |
+| `project.workspace` | what queue plan paths and reports are relative to | `~/projects/my-rig` |
+| `project.root` | every executor's working directory | `~/projects/app` |
+| `guard.git_repo` | the repo the guard stages and commits into | `~/projects/my-rig` |
 
-`root` and `git_repo` can genuinely differ: agents work from the project
-root, while the plan and report commits land in a separate docs repository.
+`root` and `git_repo` can differ: agents work from the code repository, while
+plan and report commits land in a separate docs repository.
 
----
-
-## The queue file
+## The queue
 
 `queue_<LANE>.tsv`, whitespace-separated, `#` comments:
 
-```
-id      deps      hard_gate  executor  plan_path                    [extra allowlist]
-setup   -         0          opus      PHASE_A/setup/PLAN.md
-b0      setup     0          hermes    PHASE_A/b0_census/PLAN.md
-r1      b0,l2     1          opus      PHASE_A/r1_review/PLAN.md    PHASE_A/b0_census
+```text
+# id   deps     gate  executor  plan_path                    [extras]
+setup  -        0     opus      PHASE_A/setup/PLAN.md
+b0     setup    0     opencode  PHASE_A/b0/PLAN.md           res=db  prio=5
+l1     b0       1     sonnet    PHASE_A/l1/PLAN.md           reviewer=opus  timeout=90
+r1     l1,b0    0     opus      PHASE_A/r1/PLAN.md           PHASE_A/l1
 ```
 
-- **deps** — comma-separated row ids (any lane), or `-`. A dep is met when its
-  sentinel says `CLOSED`.
-- **hard_gate** — `1` parks the lane before this row until `orch approve <id>`.
+- **deps** — comma-separated row ids (any lane), or `-`. A dep is met when it is
+  **accepted**, never on a bare claim.
+- **gate** — `1` parks the lane before this row until `orch approve <id>` (or the
+  Steward, for `gate_kind=steward`).
 - **plan_path** — relative to the workspace. Its *directory* becomes the row's
   allowlist automatically.
-- **extra allowlist** (optional 6th column) — extra paths this row may stage,
-  for the case where a row legitimately writes into another row's folder.
+- **extras** — tokens with `=` are metadata (`res`, `review`, `reviewer`,
+  `timeout`, `prio`, `accept`, `preflight`, `rearm`, `gate_kind`, `needs`); the
+  rest are extra allowlist paths.
 
-## The sentinel contract
+Appending or editing rows while the engine runs is safe and is the intended
+workflow. With `guard.queue_watch: true`, edits made outside `orch row add` are
+reported in the digest unless an operator commits or accepts them.
 
-A row is closed by exactly one file: `state/<id>.status`.
+## Claims
 
+A row closes with:
+
+```bash
+orch done <id> "one-line summary"              # normal close
+orch done <id> "…" --outcome nogo|held|fail|infeasible   # a verdict row's answer
+orch blocked <id> "precise reason"              # stop; unblock if junior
+orch escalate <id> "why only the Owner can decide this"   # ROUTE_A: halt and page
 ```
-CLOSED
-one-line summary of what happened
-```
 
-Line 1 is `CLOSED`, `BLOCKED`, or `ESCALATED` (the row needs the operator). Anything else halts the
-lane. **A session that ends without writing one halts the lane and pages you** —
-silence is never treated as success.
+`orch done` writes `state/<id>.status` only after the close checks pass. A
+session that writes the file itself, or ends with
+`ORCH_CLOSE <id> <VERDICT> — <summary>`, is judged the same way. Unblockers,
+reviewers and plan reviewers use `orch verdict <session> <VERDICT> "…"`.
+
+What can refuse a close:
+
+- a `STOP`, `REFUSED` or `HEADS_UNCHANGED no` line in the row's evidence without
+  a signed ruling in `PROGRESS.md` (`SIGNED_RULING <id>`);
+- missing `PROGRESS.md`, or one written before dispatch;
+- a placeholder summary;
+- a failing acceptance probe (`<plan dir>/ACCEPT.sh` or `accept=<file>`);
+- a change to a protected path (`guard.protected_paths`) since the row's first
+  dispatch.
 
 ## The allowlist, derived
 
-There is no hand-maintained allowlist table any more. For row `id` with plan
-`PHASE_A/thing/PLAN.md`:
+For row `id` with plan `PHASE_A/thing/PLAN.md`:
 
-```
-PHASE_A/thing            the row's own phase folder
-REPORTS/id_              its report pack prefix
-<guard.shared_paths>     what every closing row touches
-<queue column 6>         explicit extras
-<phase folder>/ALLOWLIST one path per line, if the file exists
+```text
+PHASE_A/thing              the row's own phase folder
+REPORTS/id_                its report-pack prefix
+<guard.shared_paths>       what every closing row touches
+<queue extras>             explicit extra paths
+<phase folder>/ALLOWLIST   one path per line, if present
 ```
 
-Check any row's with `orch guard allowlist <id>`.
+Check any row with `orch guard allowlist <id>`. `orch commit <id> -m "…" -- <paths>`
+stages only those paths; for shared files it stages only the hunks whose changed
+lines name the row id.
 
 ---
 
 ## Commands
 
-```
-orch init [dir] [--preset <name>] [--name ...] [--session ...]
-orch lint                          validate the ladder before dispatching
-orch start [lanes...]              bring watchers up in tmux
-orch status [full] | orch json     resolved state
-orch dashboard                     adaptive all-lane view (compact in short panes)
-orch dashboard focused [--lane L]  detailed lane view; auto-focuses when omitted
-orch dashboard full [--lane L]     expanded multi-lane ladders
-orch monitor                       one-second read-only quick-peek monitor
-orch attach                        attach to the tmux session
+The full list is in `orch --help`; grouped by what you are doing:
 
-orch approve <id>                  release a approval gate
-orch assign <id> <executor|default>  retier a pending row
-orch assignments [all]             effective executor per row
-orch dispatch <id>                 fire one row by hand
-orch done <id> "summary"           close a row from the CLI (refused over the row's own stop line)
-orch closecheck <id>               the stop-line check `done` runs; for rows that write their own sentinel
-orch blocked <id> "reason"         stop a row from the CLI
-orch reset <id>                    clear sentinels, counters and the window stamp
-orch adopt <id>                    claim an already-open window as the row's session
-orch prompt <id>                   regenerate a row's work order
+### Rig
 
-orch day | night                   pause / resume auto-chaining
-orch pause [lane] | resume | stop [lane] | unstop
-
-orch hold <id> <res>[,<res>...] -- <cmd>    run holding atomic leases (re-entrant for their owner)
-orch lease acquire|release <res> <id>       hold a lease across a span (a parity pair)
-orch commit <id> -m "msg" -- <paths>        commit through the firewall (shared paths hunk by hunk)
-orch longrun [--venv <dir>] <log> -- <cmd>  setsid job; the job writes its own PID; tail/ps handover
-orch venvcheck <venv>                       CLEAR / ARMED / BUSY before using or arming a shared venv
-orch guard status|start|finish|allowlist|force-release
-
-orch bot start|stop|status|poll|test|doctor    Telegram status bot
-orch notify "Title" "Body"                     send a test push
+```text
+orch init [dir] [--preset strict] [--name …] [--session …]
+orch setup questions|apply|defaults|rules|card|check
+orch lint | preflight [--round R|ids|--pending] [--run] [--review]
+orch start [lanes…] | disable <lanes…> | day | night
+orch pause [lane] | resume [lane] | stop [lane] | unstop
+orch status [full] · orch json · orch dashboard [current|focused|full] · orch monitor · orch attach
+orch report [--round R] [--json]
+orch engine status|stop|log|tick | migrate [--apply …]
 ```
 
-## Close, commit and dispatch guards
+### Rows
 
-- **No CLOSED over a stop line.** `orch done <id>` first runs `lib/close_check.py`:
-  when the row folder or its report packs carry a `HEADS_UNCHANGED no`, `STOP` or
-  `REFUSED` line (instrument output; line-leading forms in Markdown; falsifier and
-  self-test outputs, plan-side files and every `*.local*` path excluded), the close is
-  refused unless PROGRESS.md names `SIGNED_RULING <id>` for a RATIFIED/RULED entry in
-  DECISIONS.md. Rows that write their own sentinel run `orch closecheck <id>` first.
-- **Shared paths hunk by hunk.** For every `guard.shared_paths` entry `orch commit`
-  stages only the zero-context hunks whose changed lines name the row id; other rows'
-  pending hunks stay unstaged. No hunk of the row's own → refused, index reset.
-  `ORCH_SHARED_WHOLE=1` stages a whole shared file on the record.
-- **Pair leases.** `orch hold <id> a,b -- cmd` takes several leases in sorted order;
-  a lease already held by `<id>` (a span opened with `orch lease acquire`) is passed
-  through, never waited on and never released by the inner call.
-- **Gated-row probes.** `<instance>/gate_probes.tsv` (`<row id | lane><TAB><command>`,
-  row wins) declares a probe the watcher runs from the project root before an agent
-  dispatch of a gate=1 row; while it fails the row is not dispatched (one event line,
-  a banner, one notification; output in `state/<id>.probe.out`).
-- **Watcher liveness is per instance.** A process `orchestrator_core.sh run <L>` counts
-  as this instance's watcher only when the `ORCH_INSTANCE` in its environment resolves
-  to this instance, so rigs sharing a host and a lane letter never mask each other.
-
-## When a lane stops
-
-Three states look similar from the outside and are not:
-
-| what you see | what it means | what to do |
-|---|---|---|
-| `RUNNING <id>` | a session **this rig dispatched** holds the row | watch it: `orch attach` |
-| `QUIET <id> · no output for N min` | that same session has printed nothing past the stall threshold. It may be thinking, or it may have finished its turn without writing a sentinel | look at the pane. Warned, never killed |
-| `ORPHAN WINDOW '<id>'` | a window bears the row's name but this rig did not dispatch it — normally a finished session left open across an `orch reset` | close it (`tmux kill-window -t <session>:<id>`) and the lane dispatches within one poll. Or `orch adopt <id>` if it really is working |
-
-`orch status` is the only authoritative surface. `state/lane_<L>.info` is a
-breadcrumb the watcher writes and nothing reads back, so its second line always
-says whether a watcher is still behind the first: `lane watcher pid N LIVE` or
-`lane watcher DOWN since …`. A halted banner with `DOWN` under it is a frozen
-record of a past halt, not a live alarm — and `orch status` appends
-`[no watcher — 'orch start']` to the same lane for the same reason.
-
-`orch start` decides what to (re)start from the watcher **process**, never from
-the presence of its window, so a window that outlives its watcher can no longer
-turn `orch start` into a silent no-op.
-
-## Dashboard views
-
-The default `current` view is adaptive. At normal terminal heights it gives
-almost the whole screen to fitted lane ladders, keeping every lane visible and
-placing current/actionable rows first. In a genuinely short split it falls back
-to one row per lane with progress, state, executor, and the immediate reason it
-is waiting. Attention and events share a three-line footer, and live panes take
-space only while a session is actually running. `focused` expands one lane;
-pass `--lane A` to choose it, or let the dashboard pick a running/attention
-lane. `full` always uses expanded ladders. Every view remains read-only.
-
-## Quick monitor
-
-`orch monitor` is the operator's glance view for large rigs. It refreshes once
-per second and answers what is running, which five lane-head rows are most
-likely to run next, what needs operator action now, what is holding progress,
-and where every lane currently stands. Approvals are shown only when their
-dependencies are complete; future gates are counted without being presented as
-immediate work.
-
-```bash
-orch monitor                 # live, refresh every second
-orch monitor --once          # render one snapshot and exit
-orch monitor --lane A        # restrict to one lane
-orch monitor --next 8        # show eight upcoming lane heads
-orch monitor --interval 2    # use a slower refresh
-orch monitor --no-color      # plain terminal output
+```text
+orch assign <id> <executor|default> | assignments [all] | approve <id> | dispatch <id>
+orch done <id> "…" | blocked <id> "…" | escalate <id> "…" | verdict <session> <V> "…"
+orch reset <id> | adopt <id> | prompt <id>… | --all-pending | closecheck <id>
+orch rearm <id> "reason" | rearm round-start <tag> "reason"
+orch row add <lane> "<queue line>" "why" | row diff | row sync ["why"]
 ```
 
-The monitor uses the same state resolver as `status` and `dashboard`. It has no
-control keys and performs no writes, network or database calls, tmux input, or
-model calls. Multiple monitor processes can safely observe the same rig.
+### Rounds and decisions
 
-## Telegram
+```text
+orch round new|add-lanes|start|status|close|list|review|archive|score …
+orch archive <lanes…> | --complete        orch score [--show]
+orch gd next [--reserve "title"] | index | digest | show <id> | grep <re> | set-status | check
+```
 
-`push` fires on gates, halts and completions. It is gated three ways: enabled
-in `orch.yaml`, `control/WATCHDOG_ARMED` present, and outside quiet hours. It
-fails silently by design — a chat outage must never break a lane.
+### Guard and resources
 
-`orch bot start` runs a polling daemon that answers `status` from one
-authorized user id with the live snapshot plus the running pane's tail. It is
-read-only: it never touches a gate, a sentinel, or a keystroke.
+```text
+orch hold <id> <res>[,<res>…] -- <cmd…>   orch lease acquire|release <res> <owner>
+orch commit <id|plan:TAG> -m "msg" -- <paths…>
+orch guard status|allowlist|protected|force-release
+orch longrun [--venv <dir>] <log> -- <cmd…>   orch venvcheck <venv>
+```
 
-> Only one process may long-poll a given bot token. If a gateway already polls
-> the token you use for push, create a **second** bot for polling.
+### Autonomy (all off or neutral by default)
 
-## Tiers and models
+```text
+orch service install|uninstall|status
+orch steward status|incidents|log|inbox [done <k> [LETTER] ["note"]]
+orch steward wake "why" | close <n> "why"
+orch park <id> ["why"] | unpark <id> | revert [<k> [--dry-run]] | why <id>
+orch executor status | fallback <X> [--dry-run] | restore <X> ["why"]
+orch spend run --provider P --est USD [--row id] -- <cmd…>
+orch spend status|ledger|caps [approve]|answer <id> A|B
+orch phase open|rest|close <P> … | status | approve | off
+orch digest [--send] [--since <epoch>]
+orch bot start|stop|status|test|doctor|poll   orch notify "T" "B"
+```
 
-A row's **executor** is the program that runs it (`opus`, `opencode`,
-`hermes`, ...). Its **flavor** is the work order it receives. The two are
-independent, so any model can play any role:
+---
+
+## Configuration that matters
+
+`orch.yaml` is re-read when it changes. Defaults are safe: nothing is dispatched
+until a lane has `control/RUN_<lane>` (or `RUN_ALL`).
+
+```yaml
+scheduler:
+  mode: dag              # dag: declared deps only · serial: also waits for the row above
+  tick_seconds: 15
+  max_parallel: 8        # live sessions of every kind
+  min_free_mb: 3072      # RAM admission
+  min_free_disk_mb: 0    # disk admission (0 = off)
+
+close:
+  require_progress: true
+  require_commit: false
+  on_fail: redispatch    # redispatch | unblock | halt
+  max_fail: 2
+  stop_lines: true
+  protected: true
+
+review:
+  policy: all            # all | junior | none
+  default_reviewer: sonnet
+  require_different_executor: true
+  on_reject: redispatch
+  max_rejects: 2
+
+executors:
+  default: opus
+  allowed: [opus, sonnet, haiku, opencode, gemini, codex, manual, mock]
+  unblock_executor: sonnet
+  max_unblock_attempts: 2
+  retier_on_max_unblock: opus
+  auto_unblock: [sonnet, gemini, opencode, codex]   # `orch init` default; [] = only unblock explicitly
+  dead_window_policy: retier    # retier | halt
+
+guard:
+  shared_paths: [DECISIONS.md]
+  resources: [git-lock]          # or {name: db, slots: 3, scope: host}
+  protected_paths: []            # what only an operator plan: commit may change
+
+reaper: {closed_grace_secs: 300}
+idle: {nudge_after: 1200, max_nudges: 2, block_after: 0}
+```
+
+Every section — rounds, decisions, goals, telemetry, hooks, phases, the Steward,
+spend, health, service units — is documented in
+[`docs/V3_DESIGN.md`](docs/V3_DESIGN.md). The setup catalogue (the questions an
+agent should ask you) is [`templates/setup/questions.yaml`](templates/setup/questions.yaml).
+
+### Optional autonomy
+
+| Mechanism | What it does |
+|---|---|
+| `review.policy` | an independent reviewer on another executor re-verifies every close |
+| `orch preflight --review` | a plan-review session before a round starts |
+| Steward lane | resolves halts/gates/rest states through logged, revertable actions; walls go to an inbox |
+| `orch digest` | a twice-daily summary of what happened, acts with their undo, inbox and spend |
+| `orch service install` | systemd user units + a dead-man timer: reboot survival and one page after two failed restarts |
+| executor health | fast-death breaker, probes, remedies and auth-prompt detection per CLI |
+| spend governor | paid commands reserved against Owner-approved caps; over a cap the row waits and you get one page |
+| phases | an Owner-opened phase fence with row/ruling/day/loop caps |
+| course loops | a negative judge verdict triggers a review → replan, within the phase's caps |
+
+None of them are on by default; each needs an explicit `orch.yaml` switch.
+
+## Tiers, flavors and presets
+
+A row's **executor** is the program (`opus`, `opencode`, …). Its **flavor** is
+the work order it receives. They are independent: any model can play any role.
 
 | Flavor | Work order | Behaviour |
 |---|---|---|
-| `lead` | `_TEMPLATE_LEAD.md` | Full autonomy inside the plan's scope; escalates with `ESCALATED` or blocks with evidence. |
-| `scoped` | `_TEMPLATE_SCOPED.md` | Implements exactly the plan; blocks on any decision the plan does not make. An unblocker amends the plan. |
-| `codex` | `_TEMPLATE_CODEX.md` | Precise execution in the Codex CLI. |
-| `manual` | `_TEMPLATE_MANUAL.md` | A person does the work; the lane waits. |
+| `hard` | `_TEMPLATE_HARD.md` | Full autonomy inside the plan; escalates or blocks with evidence |
+| `jrdev` | `_TEMPLATE_JRDEV.md` | Implements exactly the plan; blocks on any judgment call |
+| `codex` | `_TEMPLATE_CODEX.md` | Precise execution in the Codex CLI |
+| `manual` | `_TEMPLATE_MANUAL.md` | A person does the work; the lane waits |
 
-Defaults: `opus`, `sonnet`, `haiku` are `lead`; `hermes`, `hermesflash`,
-`gemini`, `opencode` are `scoped`. Change any of them with `executors.flavors`.
+Work orders come from `prompts/` first, then `templates/`. `{{> part}}` includes
+a shared part; generated orders carry an `orch:generated` marker and are
+re-rendered at every dispatch.
 
-Two ready-made setups live in [`docs/examples/`](docs/examples):
+Ready-made setups:
 
-- [`opencode-only.yaml`](docs/examples/opencode-only.yaml): everything runs in
-  OpenCode on one strong model, with automatic unblockers. One tool, one API key.
-- [`mixed-tiers.yaml`](docs/examples/mixed-tiers.yaml): Claude Code for lead
-  rows, cheaper models for scoped rows.
+- [`docs/examples/opencode-only.yaml`](docs/examples/opencode-only.yaml) — one
+  CLI, one API key, every row in OpenCode.
+- [`docs/examples/mixed-tiers.yaml`](docs/examples/mixed-tiers.yaml) — a hard
+  Claude tier, cheap junior tiers and independent review.
+- `templates/presets/strict/` — a guarded starting point with doctrine
+  placeholders, a never-open clause and the safety defaults. Copy it with
+  `orch init --preset strict`.
 
-## Templates
+## How a lane stops (and what to do)
 
-Work orders come from `templates/`, instance-first:
+| What you see | What it means | What to do |
+|---|---|---|
+| `RUNNING <id>` | a session this rig dispatched holds the row | `orch attach` and watch |
+| `QUIET <id> · no output for N min` | the session printed nothing past the stall threshold; it may be thinking or may have finished its turn without a claim | look at the pane; warned, never killed |
+| `ORPHAN WINDOW '<id>'` | a window wears the row's name but this rig did not dispatch it — usually a finished session left open across a reset | close it, or `orch adopt <id>` if it is genuinely working |
+| `BLOCKED` / `ROUTE_A` | the row stopped; an unblocker may already own it | `orch why <id>`, then `orch reset <id>` or answer the page |
+| `GATED` | a hard gate waits for `orch approve <id>` | approve, or release it from the Steward's inbox |
 
-```
-<instance>/prompts/_TEMPLATE_LEAD.md    used if present
-<framework>/templates/_TEMPLATE_LEAD.md fallback
-```
-
-The shipped templates carry mechanism only — the sentinel contract, the block
-protocol, the mandatory final act. Doctrine belongs to the project.
-`templates/presets/strict/` adds a never-open secrets clause, the long-run
-helper and the close check; `orch init --preset strict` copies it into an
-instance. Write your own preset the same way: a folder of templates.
+`orch status` is authoritative. A halted banner with `engine down` under it is a
+record of a past halt, not a live alarm.
 
 ## Testing
 
 ```bash
-tests/test_mock_cycle.sh        # 101 assertions, isolated sandbox, no models
-KEEP=1 tests/test_mock_cycle.sh # keep the sandbox to inspect
+tests/run_all.sh                 # every suite; stamps .tested/<commit> on a clean tree
+tests/test_mock_cycle.sh         # guard, CLI, adapters; no engine
+KEEP=1 tests/test_mock_cycle.sh  # keep the sandbox to inspect
 ```
 
-It builds a throwaway project with its own git repo and tmux session and runs
-a real two-lane ladder through the real engine using the `mock` executor. It
-never touches a real instance.
+The suites build throwaway projects with their own git repo and tmux session and
+run only the `mock` executor. They never touch a real rig, a model or the
+network. Every suite runs tmux on a private server, and the isolation drills
+prove a test cannot reach a real rig's server.
 
----
+## Documentation
 
-## Writing a ladder for it
+| Read this | For |
+|---|---|
+| [`AGENTS.md`](AGENTS.md) | the repo's own agent guide: which doc to read for which task |
+| [`docs/SETUP_AGENT_GUIDE.md`](docs/SETUP_AGENT_GUIDE.md) | set up a new rig with the Owner's answers |
+| [`docs/PLANNING_AGENT_GUIDE.md`](docs/PLANNING_AGENT_GUIDE.md) | the contract for planning rows and rounds |
+| [`docs/COURSE_LOOP.md`](docs/COURSE_LOOP.md) | correct course mid-round |
+| [`docs/MIGRATION.md`](docs/MIGRATION.md) | move an existing v1 rig to the engine model |
+| [`docs/V2_DESIGN.md`](docs/V2_DESIGN.md) | why the engine, claims and review work this way |
+| [`docs/V3_DESIGN.md`](docs/V3_DESIGN.md) | autonomy, Steward, spend, phases, course loops, drills |
+| [`CHANGELOG.md`](CHANGELOG.md) | what changed in each release |
 
-See [`docs/PLANNING_AGENT_GUIDE.md`](docs/PLANNING_AGENT_GUIDE.md) — the
-contract a planning agent must satisfy so its phases slot straight in.
+## Contributing
+
+Mechanism, not doctrine: project-specific rules belong in a preset or an
+instance's `prompts/`, never in `lib/`. Every behaviour change needs a test.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) and
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

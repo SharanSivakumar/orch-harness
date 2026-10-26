@@ -1,18 +1,24 @@
-# Every row runs in OpenCode on one strong model. No other CLI is needed.
-# Merge these keys into your instance's orch.yaml (the rest stays as generated).
-# The model id below is an example; use any provider/model OpenCode can reach.
+# One CLI, one API key. Every row runs in OpenCode.
+# Merge these keys into your instance's orch.yaml; the rest stays as generated.
+#
+# OpenCode always runs its own configured default model. The `models` block
+# below is therefore an example of what NOT to expect: model pins are ignored
+# for the opencode executor (see README, "Tiers and models").
 executors:
   default: "opencode"
   allowed: [opencode, manual, mock]
   flavors:
-    opencode: lead               # full-autonomy work orders instead of the scoped default
-  arg_kick: [opencode]           # OpenCode takes the launch prompt as an argument
-  models:
-    opencode: "claude-fable-5-1"
-    opencode_provider: "anthropic"
-  unblock_executor: "opencode"   # blocked rows get an automatic unblocker session
-  auto_unblock: [opencode]       # (explicit, because opencode is lead-flavored here)
+    opencode: hard              # full-autonomy work orders instead of the junior default
+  arg_kick: [opencode]          # the launch prompt is passed as an argument, not pasted
+  unblock_executor: "opencode"
+  auto_unblock: [opencode]      # explicit, because opencode is hard-flavored here
   retier_on_max_unblock: "opencode"
-  max_unblock_attempts: 3
-# Per-row override when one row deserves a different model:
-#   echo "anthropic/claude-sonnet-5-5" > control/OPENCODE_MODEL_<row-id>
+  max_unblock_attempts: 2
+
+review:
+  policy: none                  # one model cannot independently review itself
+
+scheduler:
+  mode: dag
+  max_parallel: 6
+  min_free_mb: 2048

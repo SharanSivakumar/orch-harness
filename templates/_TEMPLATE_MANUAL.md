@@ -1,22 +1,23 @@
-# Work order — row __ID__ (manual, lane __LANE__)
+# Work order — __ID__  (manual row, lane __LANE__)
 
-This row is assigned to a person, not an agent. The watcher holds lane
-__LANE__ until a sentinel for `__ID__` appears.
+This row is yours, not an agent's. Rows that depend on `__ID__` wait until it is
+claimed and accepted.
 
 **Plan:** `__PLAN__`
-**Report pack:** `__REPORTS__/__ID___<date>/`
+**Report pack goes to:** `__REPORTS__/__ID___<date>/`
 
-## To complete the row
+## When it is done
+
+Write `__PLAN_DIR__/PROGRESS.md` (what was done, how to verify it), then:
 
     __CLOSECMD__
 
-## If the row cannot be completed
+## If it cannot be done
 
     __BLOCKCMD__
 
-## To hand the row to an agent instead
+## If you would rather an agent did it after all
 
     orch assign __ID__ <executor>
 
-The waiting watcher applies the reassignment on its next poll and dispatches
-the row. No restart is needed.
+The engine picks the reassignment up on its next tick and dispatches it.

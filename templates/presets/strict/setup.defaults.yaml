@@ -1,0 +1,35 @@
+# strict preset — orch.yaml defaults applied by `orch init --preset strict`, and the
+# recommendations `orch setup questions` shows.
+#
+# These are standing preferences for a guarded project: Opus unblocks every agent
+# row, junior rows get an independent reviewer, only critical events reach the
+# phone, the Steward lane handles what would otherwise page, and Claude runs at
+# high effort. Nothing here names a model id: pin one only if the project needs it.
+settings:
+  executors.allowed: [opus, sonnet, haiku, opencode, gemini, manual, mock]
+  executors.unblock_executor: opus
+  executors.max_unblock_attempts: 2
+  executors.retier_on_max_unblock: opus
+  executors.auto_unblock: [opus, sonnet, haiku, opencode, gemini]
+  executors.dead_window_policy: retier
+  executors.args: {opus: ["--effort", "high"], sonnet: ["--effort", "high"]}
+  review.policy: junior
+  scheduler.mode: dag
+  watchdog.push_min_urgency: critical
+  # The Steward lane handles what used to page; only these classes reach the phone.
+  steward.enabled: true
+  steward.tiers: {mechanical: sonnet, judgment: opus}
+  steward.page_classes: [spend, pii, secret, engine_down]
+  digest.times: ["08:00", "18:00"]
+  engine.commit_bookkeeping: true
+
+recommend:
+  executors: [opus, sonnet, opencode, gemini]
+  unblocker: opus
+  unblock_scope: all
+  review: junior
+  effort: high
+  notify: critical
+  autonomy: steward
+  digest: twice
+  always_on: service
